@@ -28,8 +28,27 @@ RULES = {
         "boundary_crossed": {"weight": 40, "label": "Security boundary crossed"},
         "boundary_interacting": {"weight": 25,
                                  "label": "Engaging with the boundary"},
-        "low_profile_movement": {"weight": 15,
-                                 "label": "Moving while bent over"},
+        # One weight per behaviour the classifier can emit. Mirrors the
+        # shipped config/threat_rules.yaml, because a test fixture that
+        # prices behaviour differently from production would let a rule
+        # change ship green.
+        "behaviour": {
+            "label": "Behaviour",
+            "weights": {
+                "JUMPING": 50,
+                "CRAWLING": 45,
+                "CROUCHING": 30,
+                "FALLING": 30,
+                "RUNNING": 25,
+                "BENT_RUN": 25,
+                "BENT_WALK": 15,
+                "BENDING": 0,
+                "WALKING": 0,
+                "STANDING": 0,
+                "SITTING": 0,
+                "UNKNOWN": 0,
+            },
+        },
         "loitering": {"weight": 20, "label": "Loitering"},
         "loitering_duration_per_minute": 5,
         "loitering_duration_max": 15,
@@ -181,18 +200,19 @@ class TestThreatEngine:
         """Context, not an event.
 
         Somebody jogging bent into the wind looks the same to a camera as
-        somebody keeping their head below a fence line. The factor lifts the
+        somebody keeping their head below a fence line. BENT_WALK lifts the
         score of an event that is already happening; on its own it must stay
         below the MEDIUM threshold so it can never be the whole reason for
-        an alert.
+        an alert. This is the weight the retired `low_profile_movement`
+        factor carried, kept deliberately so the swap changed no prices.
         """
         alone = daytime_engine().assess(ThreatContext(
             incident_type=IncidentType.LINE_CROSSING, class_name="person",
-            low_profile_movement=True, behaviour="BENT_RUN", ts=DAYTIME,
+            behaviour="BENT_WALK", ts=DAYTIME,
         ))
         assert alone.score == 15
         assert alone.level == ThreatLevel.LOW
-        assert "BENT_RUN" in alone.reasons[0].label
+        assert "Bent walk" in alone.reasons[0].label
 
     def test_moving_while_bent_adds_to_a_real_event(self):
         without = daytime_engine().assess(ThreatContext(
@@ -202,9 +222,88 @@ class TestThreatEngine:
         with_it = daytime_engine().assess(ThreatContext(
             incident_type=IncidentType.RESTRICTED_INTRUSION,
             class_name="person", in_restricted_zone=True,
-            low_profile_movement=True, behaviour="BENT_RUN", ts=DAYTIME,
+            behaviour="BENT_RUN", ts=DAYTIME,
         ))
-        assert with_it.score == without.score + 15
+        assert with_it.score == without.score + 25
+
+    def test_jumping_reaches_high_on_its_own(self):
+        """The requirement this table exists for.
+
+        Before it, `behaviour` was nothing but a label suffix on the bent
+        movement factor: a person classified JUMPING scored ZERO unless they
+        also happened to cross a line or enter a zone. The box said JUMPING
+        and the risk model knew nothing about it.
+
+        Going over something is the event a border system exists to catch,
+        so it must reach HIGH without needing corroboration - and it must do
+        so in the SCORE, not by relabelling the output.
+        """
+        assessment = daytime_engine().assess(ThreatContext(
+            incident_type=IncidentType.SUSPICIOUS_BEHAVIOUR,
+            class_name="person", behaviour="JUMPING", ts=DAYTIME,
+        ))
+        assert assessment.score == 50
+        assert assessment.level == ThreatLevel.HIGH
+        assert "Jumping" in assessment.reasons[0].label
+
+    def test_crouching_is_medium_alone_and_high_in_a_restricted_zone(self):
+        """Crouching is a shoelace as often as it is cover.
+
+        MEDIUM by itself - worth an operator's glance. One corroborating
+        factor and it is HIGH, which is the escalation the operator asked
+        for and which falls out of the arithmetic rather than a special case.
+        """
+        alone = daytime_engine().assess(ThreatContext(
+            incident_type=IncidentType.SUSPICIOUS_BEHAVIOUR,
+            class_name="person", behaviour="CROUCHING", ts=DAYTIME,
+        ))
+        in_zone = daytime_engine().assess(ThreatContext(
+            incident_type=IncidentType.SUSPICIOUS_BEHAVIOUR,
+            class_name="person", behaviour="CROUCHING",
+            in_restricted_zone=True, ts=DAYTIME,
+        ))
+        assert (alone.score, alone.level) == (30, ThreatLevel.MEDIUM)
+        assert (in_zone.score, in_zone.level) == (60, ThreatLevel.HIGH)
+
+    def test_jumping_over_a_confirmed_boundary_is_critical(self):
+        assessment = daytime_engine().assess(ThreatContext(
+            incident_type=IncidentType.LINE_CROSSING, class_name="person",
+            crossed_line=True, boundary_state="CROSSED",
+            behaviour="JUMPING", ts=DAYTIME,
+        ))
+        # 20 line + 40 confirmed boundary + 50 jumping, capped at 100.
+        assert assessment.score == 100
+        assert assessment.level == ThreatLevel.CRITICAL
+
+    def test_ordinary_behaviour_adds_nothing(self):
+        """A classification is not evidence.
+
+        Every tracked person carries a behaviour label. If ordinary ones
+        scored, every person in frame would drift upwards just by being
+        classified, and the level would stop meaning anything.
+        """
+        for behaviour in ("WALKING", "STANDING", "SITTING", "BENDING",
+                          "UNKNOWN"):
+            assessment = daytime_engine().assess(ThreatContext(
+                incident_type=IncidentType.SUSPICIOUS_BEHAVIOUR,
+                class_name="person", behaviour=behaviour, ts=DAYTIME,
+            ))
+            assert assessment.score == 0, behaviour
+            assert assessment.level == ThreatLevel.LOW, behaviour
+            assert assessment.reasons == [], behaviour
+
+    def test_an_unknown_behaviour_label_is_ignored_not_guessed(self):
+        """A label with no weight scores nothing.
+
+        Adding a behaviour to the classifier without adding it to the table
+        must leave the score alone, never fall back to some default weight.
+        """
+        assessment = daytime_engine().assess(ThreatContext(
+            incident_type=IncidentType.SUSPICIOUS_BEHAVIOUR,
+            class_name="person", behaviour="CARTWHEELING", ts=DAYTIME,
+        ))
+        assert assessment.score == 0
+        assert assessment.reasons == []
 
     def test_factors_accumulate(self):
         assessment = daytime_engine().assess(ThreatContext(

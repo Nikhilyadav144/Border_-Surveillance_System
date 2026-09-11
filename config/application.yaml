@@ -356,6 +356,53 @@ activity:
     hold_seconds: 0.30
     event_hold_seconds: 0.15
 
+    # WHICH BEHAVIOURS ARE WORTH WAKING AN OPERATOR FOR ON THEIR OWN.
+    #
+    # Every behaviour in the list above is classified, shown on the box and
+    # priced by threat_rules.yaml. Only the ones named here can RAISE an
+    # incident by themselves; the rest contribute to the score of an
+    # incident something else raised.
+    #
+    # The line is drawn at behaviours that are out of the ordinary beside a
+    # security boundary. Jumping, crawling and going to ground are all
+    # deliberate. Crouching is on the list because on a border line the cost
+    # of an operator glancing at somebody tying a shoelace is lower than the
+    # cost of missing somebody taking cover.
+    #
+    # BENT_WALK and BENT_RUN are here for a measured reason, not a guess.
+    # On CAM-01 the classifier never outputs CROUCHING or JUMPING at all:
+    # the person the operator describes as "running while crouching" is
+    # classified BENT_RUN, and the person who goes over the fence is caught
+    # by the boundary analyser rather than by a JUMPING label. Leaving these
+    # two off the list meant the one camera with real suspicious movement in
+    # it produced no behaviour event. They are still cheap by design -
+    # BENT_WALK scores 15 (LOW) and BENT_RUN 25 (MEDIUM), so they report
+    # without shouting.
+    #
+    # Nothing here fires per frame. Three separate gates stand in the way:
+    # the classifier's own debounce, the pipeline feeding only events that
+    # SETTLED this frame, and the incident manager's dedupe window - all
+    # behaviour events share one incident type, so a person who crouches,
+    # straightens and crouches again inside the window produces one record.
+    #
+    # WALKING, STANDING, SITTING and BENDING are absent and should stay
+    # absent: ordinary behaviour is not an event, and an operator who is
+    # shown everything sees nothing.
+    #
+    # Set to [] to switch behaviour-raised alerts off entirely without
+    # touching any code.
+    alerting_behaviours:
+      - JUMPING
+      - CRAWLING
+      - CROUCHING
+      - FALLING
+      - RUNNING
+      - BENT_RUN
+      - BENT_WALK
+    # An event whose classifier confidence is below this is logged and shown
+    # but does not raise an incident.
+    alert_min_confidence: 0.55
+
   # ------------------------------------------------------------------
   # Person-to-boundary relationship
   # ------------------------------------------------------------------
@@ -478,3 +525,51 @@ logging:
   console: true
   # System log rows mirrored into SQLite for the System Logs screen.
   db_level: "INFO"
+
+# ==========================================================================
+# Authentication and authorisation
+# --------------------------------------------------------------------------
+# Sits above the AI pipeline and changes nothing about it. Every value here
+# is policy, not capability: detection, tracking, behaviour, threat scoring,
+# alerts and evidence behave identically whatever is set below.
+#
+# The initial Super Admin is NOT configured here. Putting a password in a
+# file that lives in the repository is how credentials end up in Git.
+# Create the first account with:
+#
+#     SUPER_ADMIN_USER=ADMIN-001 python scripts/create_admin.py
+#
+# which prompts for the password without echoing it, or reads
+# SUPER_ADMIN_PASSWORD from the environment for an unattended setup.
+# ==========================================================================
+auth:
+  # Sign-in required for every API route except /api/health, which the login
+  # screen needs in order to say whether the backend is reachable at all.
+  enabled: true
+
+  # Idle timeout. Measured from the last authenticated request, not from
+  # sign-in, so somebody working continuously is never interrupted. Thirty
+  # minutes is long enough not to bite during a demonstration and short
+  # enough to matter on a shared terminal.
+  session_idle_minutes: 30
+
+  # A ceiling regardless of activity. A session left open overnight ends.
+  session_absolute_hours: 12
+
+  # How long before the idle timeout the interface warns and offers to
+  # continue. Two minutes is enough to notice without being a nuisance.
+  warn_before_expiry_seconds: 120
+
+  # Consecutive failures before a cooldown starts. The counter resets on any
+  # success, so an occasional typo never accumulates into a lock.
+  max_failed_attempts: 5
+
+  # How long that cooldown lasts. A cooldown, not a permanent lock: it
+  # lapses by itself, and an admin can clear it immediately from the User
+  # Management screen. Nobody is ever locked out with no way back.
+  lockout_minutes: 15
+
+  # Who may START and STOP a camera. True means Super Admin only, which
+  # matches how a command centre works - administrators bring feeds online,
+  # operators watch them. Set false to let any signed-in user do it.
+  camera_control_requires_admin: true

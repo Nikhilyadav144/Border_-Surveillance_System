@@ -343,6 +343,19 @@ class TrackManager:
         self.tracks: dict[int, TrackState] = {}
         self.closed_tracks: list[TrackState] = []
         self._total_created = 0
+        #: Every identity that has EVER reached `min_hits` during this
+        #: session, mapped to its latest class name.
+        #:
+        #: This is the session's unique-object ledger and it is deliberately
+        #: not `_total_created`. That counter includes one-frame flickers -
+        #: on CAM-01 it counted a two-hit detection on a fence post - so a
+        #: "unique people" figure built on it would be inflated by exactly
+        #: the false positives the confirmation rule exists to reject.
+        #:
+        #: Keyed by track number, so a person who appears in 500 frames is
+        #: one entry, not 500. The value is refreshed on every observation so
+        #: a track the detector relabels is counted under its final class.
+        self._ever_confirmed: dict[int, str] = {}
 
     # -- lifecycle --------------------------------------------------------
 
@@ -397,6 +410,13 @@ class TrackManager:
                 confidence=confidence,
                 direction_change_degrees=self.direction_change_degrees,
             )
+
+            # Record the identity once it is trustworthy, and keep its class
+            # current. Membership of this dict is what "unique objects seen
+            # this session" means.
+            if state.frames_seen >= self.min_hits:
+                self._ever_confirmed[track_number] = state.class_name
+
             active.append(state)
 
         closed: list[TrackState] = []
@@ -478,7 +498,28 @@ class TrackManager:
     def total_created(self) -> int:
         return self._total_created
 
+    def unique_seen(self, names: set[str]) -> int:
+        """How many DISTINCT confirmed objects of these classes this session.
+
+        The session total, not a live count. A person who walked through at
+        the start and left is still counted; a person standing in view for
+        500 frames is counted once. Both are the opposite of what
+        `count_class` reports, which is deliberately "how many are in view
+        right now".
+        """
+        lowered = {n.lower() for n in names}
+        return sum(1 for cls in self._ever_confirmed.values()
+                   if cls.lower() in lowered)
+
+    def unique_breakdown(self) -> dict[str, int]:
+        """Distinct confirmed objects this session, per class name."""
+        counts: dict[str, int] = {}
+        for cls in self._ever_confirmed.values():
+            counts[cls] = counts.get(cls, 0) + 1
+        return counts
+
     def reset(self) -> None:
         self.tracks.clear()
         self.closed_tracks.clear()
         self._total_created = 0
+        self._ever_confirmed.clear()

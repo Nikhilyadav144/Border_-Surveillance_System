@@ -52,18 +52,55 @@ factors:
     weight: 25
     label: "Physically engaging with the security boundary"
 
-  # CONTEXT, not an incident. Travelling with the torso folded well off
-  # vertical is how a person moves when they would rather not be seen over a
-  # barrier, and on CAM-01 one person covered the fence line at 3.0 body
-  # heights per second with his torso 75 degrees over.
+  # WHAT THE PERSON IS DOING.
   #
-  # It is weighted low and has no entry in minimum_levels, so it can never
-  # raise an incident on its own. Somebody jogging bent into the wind, or
-  # carrying something heavy, looks the same to a camera. What it does is
-  # lift the score of an event that is already happening.
-  low_profile_movement:
-    weight: 15
-    label: "Moving while bent over"
+  # One weight per behaviour that core/behaviour_classifier.py can emit.
+  # Until this table existed, behaviour contributed NOTHING to the score:
+  # a person could be classified JUMPING and score zero unless they also
+  # happened to cross a line or enter a zone. The label said one thing and
+  # the risk model knew nothing about it.
+  #
+  # The numbers are chosen against the level thresholds below, not picked
+  # for feel. HIGH begins at 50 and MEDIUM at 25, so:
+  #
+  #   JUMPING 50   reaches HIGH on its own, as border surveillance
+  #                requires - going over something is the event this
+  #                system exists to catch. Add a restricted zone (30) and
+  #                it becomes 80, which is CRITICAL.
+  #   CRAWLING 45  just short of HIGH alone: deliberate low movement, but
+  #                one frame of a person bending to the ground looks the
+  #                same, so it needs one corroborating factor to escalate.
+  #   CROUCHING 30 MEDIUM alone, HIGH (60) with a zone intrusion. Crouching
+  #                by itself is tying a shoelace as often as it is hiding.
+  #   FALLING 30   MEDIUM. This is a welfare signal as much as a threat
+  #                one; an operator should look, not scramble.
+  #   RUNNING 25   MEDIUM. People run for innocent reasons constantly.
+  #   BENT_RUN 25  travelling fast while folded over - measured on CAM-01
+  #                at 3.0 body heights per second with the torso 75 degrees
+  #                over, which is how somebody moves when they would rather
+  #                not be seen above a barrier.
+  #   BENT_WALK 15 the same shape at walking pace. This carries forward the
+  #                exact weight the old `low_profile_movement` factor had,
+  #                which this table replaces; keeping both would have
+  #                double-counted the same observation.
+  #   WALKING, STANDING, SITTING, BENDING, UNKNOWN: 0. Ordinary behaviour
+  #                is not evidence of anything and must not drift a score
+  #                upwards just by being classified.
+  behaviour:
+    label: "Behaviour"
+    weights:
+      JUMPING: 50
+      CRAWLING: 45
+      CROUCHING: 30
+      FALLING: 30
+      RUNNING: 25
+      BENT_RUN: 25
+      BENT_WALK: 15
+      BENDING: 0
+      WALKING: 0
+      STANDING: 0
+      SITTING: 0
+      UNKNOWN: 0
 
   loitering:
     weight: 20

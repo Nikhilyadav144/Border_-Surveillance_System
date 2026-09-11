@@ -1,0 +1,76 @@
+#!/bin/bash
+# =====================================================================
+# IBVAP.app  ->  Contents/MacOS/IBVAP
+# =====================================================================
+#
+# This is the file macOS runs when the app is double-clicked. It does as
+# little as possible: find the project folder, then hand over to
+# scripts/launch_ibvap.sh, which lives in the project and is therefore
+# the version-controlled, editable one.
+#
+# Keeping the logic in the project rather than in here matters: the app
+# bundle is an opaque folder that people do not think to look inside, so
+# anything important buried in it is effectively invisible. Editing the
+# launcher should mean editing a normal file in a normal folder.
+# =====================================================================
+
+set -u
+
+SELF="${BASH_SOURCE[0]}"
+APP_DIR="$(cd "$(dirname "$SELF")/../.." && pwd)"        # .../IBVAP.app
+APP_PARENT="$(dirname "$APP_DIR")"                        # wherever it sits
+RES="$APP_DIR/Contents/Resources"
+
+fail() {
+    osascript \
+        -e 'on run {t, m}' \
+        -e 'display alert t message m as critical' \
+        -e 'end run' \
+        -- "IBVAP could not start" "$1" >/dev/null 2>&1
+    exit 1
+}
+
+# Candidates, most specific first:
+#   1. the path recorded when this app was created
+#   2. the folder the app is sitting in (app kept inside the project)
+#   3. a project folder next to the app (app dragged to the Desktop)
+#   4. the usual place
+CANDIDATES=()
+if [ -f "$RES/project_path" ]; then
+    CANDIDATES+=("$(cat "$RES/project_path")")
+fi
+CANDIDATES+=(
+    "$APP_PARENT"
+    "$APP_PARENT/AI-Border-Surveillance"
+    "$HOME/Desktop/AI-Border-Surveillance"
+)
+
+PROJECT=""
+for candidate in "${CANDIDATES[@]}"; do
+    if [ -n "$candidate" ] && [ -f "$candidate/api/server.py" ]; then
+        PROJECT="$candidate"
+        break
+    fi
+done
+
+[ -n "$PROJECT" ] || fail \
+"Could not find the AI-Border-Surveillance project folder.
+
+Looked in:
+$(printf '  %s\n' "${CANDIDATES[@]}")
+
+Move IBVAP.app into the project folder, or put the project back at
+~/Desktop/AI-Border-Surveillance, then try again."
+
+LAUNCHER="$PROJECT/scripts/launch_ibvap.sh"
+[ -f "$LAUNCHER" ] || fail \
+"Found the project at:
+
+$PROJECT
+
+but scripts/launch_ibvap.sh is missing from it."
+
+# exec, not call: this process becomes the launcher, so the Dock's Quit
+# reaches the launcher's signal handler directly and the server it
+# started is shut down with it.
+exec /bin/bash "$LAUNCHER" "$PROJECT"

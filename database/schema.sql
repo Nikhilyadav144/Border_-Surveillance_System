@@ -261,3 +261,94 @@ CREATE TABLE IF NOT EXISTS settings (
     value      TEXT,
     updated_at TEXT NOT NULL
 );
+
+-- ==========================================================================
+-- AUTHENTICATION AND AUTHORISATION
+-- --------------------------------------------------------------------------
+-- Added above the surveillance schema, not into it. Nothing below is read by
+-- the AI pipeline, and nothing the pipeline writes is read by these tables.
+-- Dropping all three would leave detection, tracking, threat scoring, alerts
+-- and evidence working exactly as before.
+-- ==========================================================================
+
+-- --------------------------------------------------------------------------
+-- users: who may sign in, and as what
+-- --------------------------------------------------------------------------
+-- `user_id` is the operator-facing identifier typed at the login screen
+-- (ADMIN-001, USER-002). `username` is the display name in the header. They
+-- are deliberately separate: a person's name can change without invalidating
+-- the credential they log in with.
+--
+-- `password_hash` holds a self-describing scrypt string - algorithm, cost
+-- parameters, salt and digest - so the cost can be raised later without
+-- stranding the accounts hashed under the old one. A plain password is never
+-- written here, and there is no column it could be written to.
+CREATE TABLE IF NOT EXISTS users (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL UNIQUE,
+    username        TEXT NOT NULL,
+    password_hash   TEXT NOT NULL,
+    role            TEXT NOT NULL,             -- SUPER_ADMIN | NORMAL_USER
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    -- Consecutive failures since the last success. Reset to 0 on any
+    -- successful sign-in, so an occasional typo never accumulates into a lock.
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    -- Set when the threshold is reached. A cooldown, not a permanent lock:
+    -- it lapses on its own, and an admin can clear it immediately.
+    locked_until    REAL,
+    last_login_ts   REAL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_users_role   ON users(role);
+CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active);
+
+-- --------------------------------------------------------------------------
+-- auth_sessions: an issued sign-in, server side
+-- --------------------------------------------------------------------------
+-- NOT the `sessions` table above - that one is a camera PROCESSING session
+-- and has nothing to do with people. The names are close enough to confuse,
+-- which is exactly why this one is prefixed.
+--
+-- The token itself is NEVER stored. Only its SHA-256 fingerprint is, so a
+-- copy of this database does not hand anybody a set of live sessions. The
+-- row is the authority on whether a token still works, which is what makes
+-- logout an actual revocation rather than a client-side gesture.
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token_hash   TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    created_ts   REAL NOT NULL,
+    -- Moved forward on every authenticated request; the idle timeout is
+    -- measured from this, not from creation.
+    last_seen_ts REAL NOT NULL,
+    -- A hard ceiling regardless of activity, so a session left open on a
+    -- shared terminal cannot live for ever.
+    expires_ts   REAL NOT NULL,
+    revoked      INTEGER NOT NULL DEFAULT 0,
+    user_agent   TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_exp  ON auth_sessions(expires_ts);
+
+-- --------------------------------------------------------------------------
+-- audit_logs: who did what, and whether it worked
+-- --------------------------------------------------------------------------
+-- Separate from system_logs on purpose. That table is application logging -
+-- verbose, rotated, written for a developer. This one is a security record:
+-- every row is an action a person took, and a FAILED row is as important as a
+-- SUCCESS one. A rejected admin call is recorded here precisely because that
+-- is the interesting event.
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       REAL NOT NULL,
+    ts_text  TEXT NOT NULL,
+    user_id  TEXT,                              -- NULL when sign-in failed
+    action   TEXT NOT NULL,
+    resource TEXT,
+    status   TEXT NOT NULL DEFAULT 'SUCCESS',   -- SUCCESS | FAILED | DENIED
+    detail   TEXT                               -- JSON, never a credential
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts     ON audit_logs(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_user   ON audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action);

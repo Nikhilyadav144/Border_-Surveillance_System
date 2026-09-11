@@ -66,11 +66,20 @@ body {
   box-sizing: border-box;
 }
 
+/* This file is the Vite starter template's stylesheet. Its palette is a
+   LIGHT one, and it set every h1 and h2 to --text-h, which is #08060d - a
+   near-black heading painted on the command centre's near-black background.
+   Every page title in the app was invisible on any machine whose OS was in
+   light mode; on a dark-mode Mac the same variable resolves to near-white,
+   which is why it went unnoticed.
+
+   Headings now inherit the app's own colour from App.css. The starter's
+   variables are left alone so nothing else shifts. */
 h1,
 h2 {
   font-family: var(--heading);
   font-weight: 500;
-  color: var(--text-h);
+  color: inherit;
 }
 
 h1 {

@@ -493,6 +493,81 @@ class Database:
     def get_incident(self, incident_id: int) -> Optional[sqlite3.Row]:
         return self.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
 
+    def get_events(
+        self,
+        camera_id: str | None = None,
+        session_id: int | None = None,
+        session_ids: "list[int] | None" = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        """Recorded events for the operator log: one row per INCIDENT.
+
+        An incident joined to the alert it raised. Two tables, one row,
+        because they are two halves of the same event: the incident carries
+        what the analysis concluded (type, track, threat level, scoring
+        reasons, the detail blob), and the alert carries the sentence the
+        operator was shown. Reading only the incidents table would mean
+        re-deriving that sentence somewhere else, and then there would be
+        two versions of what happened.
+
+        One row per incident and not per alert: ``IncidentManager`` already
+        deduplicates, so a threat that persists for a hundred frames is one
+        incident here, exactly as it was one alert at the time. Nothing in
+        this method re-counts or re-groups anything.
+
+        LEFT JOIN on purpose. An incident below the alerting threshold has
+        no alert row, and it is still a recorded event; dropping it would
+        make the log disagree with the incident count beside it.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if camera_id:
+            clauses.append("i.camera_id=?")
+            params.append(camera_id)
+        if session_id is not None:
+            clauses.append("i.session_id=?")
+            params.append(session_id)
+        if session_ids is not None:
+            # The consolidated view: the current concluded run of EVERY
+            # camera, in one timeline. An empty list means no camera has
+            # concluded a run, which must return nothing rather than
+            # quietly falling back to the whole history of the database.
+            if not session_ids:
+                return []
+            marks = ",".join("?" for _ in session_ids)
+            clauses.append(f"i.session_id IN ({marks})")
+            params.extend(int(value) for value in session_ids)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        return self.query(
+            f"""
+            SELECT i.id              AS incident_id,
+                   i.session_id      AS session_id,
+                   i.camera_id       AS camera_id,
+                   i.track_number    AS track_number,
+                   i.object_class    AS object_class,
+                   i.incident_type   AS incident_type,
+                   i.threat_score    AS threat_score,
+                   i.threat_level    AS threat_level,
+                   i.reasons         AS reasons,
+                   i.zone_name       AS zone_name,
+                   i.detail          AS detail,
+                   i.ts              AS ts,
+                   i.ts_text         AS ts_text,
+                   i.status          AS status,
+                   i.escalation_count AS escalation_count,
+                   a.message         AS message,
+                   a.object_label    AS object_label,
+                   a.severity        AS severity
+              FROM incidents i
+              LEFT JOIN alerts a ON a.incident_id = i.id
+             {where}
+             ORDER BY i.ts DESC
+             LIMIT ?
+            """,
+            params,
+        )
+
     def count_incidents(self, status: str | None = None) -> int:
         if status:
             return int(self.scalar(
@@ -795,3 +870,260 @@ class Database:
             "plates_read": int(self.scalar(
                 "SELECT COUNT(*) FROM plates WHERE plate_text IS NOT NULL")),
         }
+
+    # ==================================================================
+    # authentication and authorisation
+    # ------------------------------------------------------------------
+    # Added alongside the surveillance tables, not into them. No method
+    # below is called from core/, and none of them touch a camera, a track
+    # or an incident. The AI pipeline runs identically whether or not a
+    # single user row exists.
+    # ==================================================================
+
+    # -- users ---------------------------------------------------------
+
+    def create_user(
+        self,
+        user_id: str,
+        username: str,
+        password_hash: str,
+        role: str,
+        is_active: bool = True,
+    ) -> int:
+        """Insert a user. The caller hashes; this layer never sees a password.
+
+        Deliberately takes `password_hash` rather than `password`. A method
+        that accepted a plain one would eventually be called with a plain
+        one, and the only reliable way to keep credentials out of the
+        database is for the database layer to have no way to put them there.
+        """
+        stamp = ts_text()
+        sql, values = self._insert("users", {
+            "user_id": user_id,
+            "username": username,
+            "password_hash": password_hash,
+            "role": role,
+            "is_active": 1 if is_active else 0,
+            "failed_attempts": 0,
+            "created_at": stamp,
+            "updated_at": stamp,
+        })
+        return self.execute(sql, values)
+
+    def get_user(self, user_id: str) -> Optional[sqlite3.Row]:
+        return self.query_one(
+            "SELECT * FROM users WHERE user_id=?", (user_id,))
+
+    def list_users(self) -> list[sqlite3.Row]:
+        """Every account, for the admin screen. Hashes are not selected."""
+        return self.query(
+            """
+            SELECT id, user_id, username, role, is_active, failed_attempts,
+                   locked_until, last_login_ts, created_at, updated_at
+              FROM users
+             ORDER BY CASE role WHEN 'SUPER_ADMIN' THEN 0 ELSE 1 END,
+                      user_id
+            """
+        )
+
+    def count_admins(self, active_only: bool = True) -> int:
+        """How many Super Admins exist.
+
+        Used to refuse the operation that locks everybody out: disabling,
+        demoting or deleting the last administrator.
+        """
+        if active_only:
+            return int(self.scalar(
+                "SELECT COUNT(*) FROM users "
+                "WHERE role='SUPER_ADMIN' AND is_active=1"))
+        return int(self.scalar(
+            "SELECT COUNT(*) FROM users WHERE role='SUPER_ADMIN'"))
+
+    def update_user(self, user_id: str, **fields: Any) -> None:
+        """Update named columns on one user.
+
+        The allow-list is not decoration. Without it, a request body that
+        happened to carry `role` or `password_hash` could reach this method
+        and set them; with it, only the columns an administrator is meant to
+        change can be written, whatever arrives from outside.
+        """
+        allowed = {"username", "role", "is_active", "password_hash",
+                   "failed_attempts", "locked_until", "last_login_ts"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        updates["updated_at"] = ts_text()
+        assignments = ", ".join(f"{k}=?" for k in updates)
+        self.execute(
+            f"UPDATE users SET {assignments} WHERE user_id=?",
+            [*updates.values(), user_id],
+        )
+
+    def delete_user(self, user_id: str) -> None:
+        """Remove a user and, with them, every session they hold."""
+        self.execute("DELETE FROM auth_sessions WHERE user_id=?", (user_id,))
+        self.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+
+    def record_login_success(self, user_id: str, ts: float) -> None:
+        self.execute(
+            "UPDATE users SET failed_attempts=0, locked_until=NULL, "
+            "last_login_ts=?, updated_at=? WHERE user_id=?",
+            (ts, ts_text(ts), user_id),
+        )
+
+    def record_login_failure(
+        self, user_id: str, max_attempts: int, lock_seconds: float, ts: float
+    ) -> int:
+        """Count one failure and lock the account if it has had too many.
+
+        Returns the new consecutive-failure count. The counter is reset by
+        any success, so this measures a run of failures rather than a
+        lifetime total - somebody who mistypes once a week is never locked.
+        """
+        row = self.get_user(user_id)
+        if row is None:
+            return 0
+        attempts = int(row["failed_attempts"] or 0) + 1
+        locked_until = ts + lock_seconds if attempts >= max_attempts else None
+        self.execute(
+            "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? "
+            "WHERE user_id=?",
+            (attempts, locked_until, ts_text(ts), user_id),
+        )
+        return attempts
+
+    def clear_lockout(self, user_id: str) -> None:
+        self.execute(
+            "UPDATE users SET failed_attempts=0, locked_until=NULL, "
+            "updated_at=? WHERE user_id=?",
+            (ts_text(), user_id),
+        )
+
+    # -- sessions ------------------------------------------------------
+
+    def create_auth_session(
+        self,
+        token_hash: str,
+        user_id: str,
+        created_ts: float,
+        expires_ts: float,
+        user_agent: str | None = None,
+    ) -> None:
+        sql, values = self._insert("auth_sessions", {
+            "token_hash": token_hash,
+            "user_id": user_id,
+            "created_ts": created_ts,
+            "last_seen_ts": created_ts,
+            "expires_ts": expires_ts,
+            "revoked": 0,
+            "user_agent": (user_agent or "")[:200],
+        })
+        self.execute(sql, values)
+
+    def get_auth_session(self, token_hash: str) -> Optional[sqlite3.Row]:
+        """A session joined to its user, or None.
+
+        One query on purpose. Fetching the session and then the user would
+        leave a window in which an account is disabled between the two, and
+        the request would proceed on an account that no longer exists.
+        """
+        return self.query_one(
+            """
+            SELECT s.token_hash, s.user_id, s.created_ts, s.last_seen_ts,
+                   s.expires_ts, s.revoked,
+                   u.username, u.role, u.is_active
+              FROM auth_sessions s
+              JOIN users u ON u.user_id = s.user_id
+             WHERE s.token_hash = ?
+            """,
+            (token_hash,),
+        )
+
+    def touch_auth_session(self, token_hash: str, ts: float) -> None:
+        """Mark a session as used just now, for the idle timeout."""
+        self.execute(
+            "UPDATE auth_sessions SET last_seen_ts=? WHERE token_hash=?",
+            (ts, token_hash),
+        )
+
+    def revoke_auth_session(self, token_hash: str) -> None:
+        self.execute(
+            "UPDATE auth_sessions SET revoked=1 WHERE token_hash=?",
+            (token_hash,),
+        )
+
+    def revoke_user_sessions(self, user_id: str) -> None:
+        """Revoke every session a user holds.
+
+        Called when an account is disabled, deleted or has its password
+        reset. Without this, disabling somebody would leave them signed in
+        until their token happened to expire - which is not what an
+        administrator means by "disable".
+        """
+        self.execute(
+            "UPDATE auth_sessions SET revoked=1 WHERE user_id=?", (user_id,))
+
+    def purge_expired_sessions(self, before_ts: float) -> int:
+        """Delete sessions that expired a while ago. Housekeeping only."""
+        with self._cursor() as cur:
+            cur.execute(
+                "DELETE FROM auth_sessions WHERE expires_ts < ?", (before_ts,))
+            return int(cur.rowcount or 0)
+
+    # -- audit ---------------------------------------------------------
+
+    def insert_audit(
+        self,
+        action: str,
+        user_id: str | None = None,
+        resource: str | None = None,
+        status: str = "SUCCESS",
+        detail: dict | None = None,
+        ts: float | None = None,
+    ) -> None:
+        """Record one security-relevant action.
+
+        Never raises. An audit write that failed must not also fail the
+        request it was describing - losing a log line is bad, turning a
+        successful sign-in into a 500 is worse. The failure goes to the
+        application log instead.
+        """
+        moment = now_ts() if ts is None else ts
+        try:
+            sql, values = self._insert("audit_logs", {
+                "ts": moment,
+                "ts_text": ts_text(moment),
+                "user_id": user_id,
+                "action": action,
+                "resource": resource,
+                "status": status,
+                "detail": json.dumps(detail) if detail else None,
+            })
+            self.execute(sql, values)
+        except Exception as exc:      # pragma: no cover - defensive
+            logger.error("Could not write audit row %s: %s", action, exc)
+
+    def get_audit_logs(
+        self,
+        user_id: str | None = None,
+        action: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user_id:
+            clauses.append("user_id=?")
+            params.append(user_id)
+        if action:
+            clauses.append("action=?")
+            params.append(action)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        return self.query(
+            f"SELECT * FROM audit_logs {where} ORDER BY ts DESC LIMIT ?",
+            params,
+        )

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>IBVAP</string>
+	<key>CFBundleDisplayName</key>
+	<string>IBVAP</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.visionvigilants.ibvap</string>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleExecutable</key>
+	<string>IBVAP</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<!-- The launcher deliberately stays alive for as long as the server
+	     runs, so that quitting the app stops the server. Without this the
+	     app would be a fire-and-forget script and the Dock would offer no
+	     way to shut anything down. -->
+	<key>LSBackgroundOnly</key>
+	<false/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Vision Vigilants - Intelligent Border Video Analytics Platform</string>
+</dict>
+</plist>

@@ -88,11 +88,6 @@ BEHAVIOURS: tuple[str, ...] = (
     BENT_RUN, BENT_WALK, RUNNING, WALKING, STANDING,
 )
 
-#: Behaviours that combine a folded posture with travel. Kept as a named set
-#: so the threat rules can ask "was this person moving low?" without
-#: hard-coding label strings in three places.
-LOW_PROFILE_MOVEMENT: frozenset[str] = frozenset({BENT_WALK, BENT_RUN})
-
 
 @dataclass
 class BehaviourEvent:

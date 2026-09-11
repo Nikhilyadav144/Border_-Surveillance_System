@@ -40,10 +40,7 @@ from core.evidence import EvidenceManager
 from core.incident_manager import IncidentManager
 from core.line_crossing import LineCrossingEngine
 from core.low_light import LowLightDetector
-from core.behaviour_classifier import (
-    LOW_PROFILE_MOVEMENT,
-    BehaviourClassifier,
-)
+from core.behaviour_classifier import BehaviourClassifier
 from core.boundary_interaction import (
     CROSSED,
     BoundaryInteractionAnalyzer,
@@ -285,7 +282,21 @@ class SurveillancePipeline:
                 config.get("activity.movement.stationary_speed", 0.15)),
             min_support=int(config.get("activity.movement.min_support", 6)),
         )
-        behaviour_cfg = config.section("activity").get("behaviour", {}) or {}
+        behaviour_cfg = dict(
+            config.section("activity").get("behaviour", {}) or {})
+
+        # WHICH behaviours may raise an incident on their own, and how sure
+        # the classifier must be before one does. These two are alerting
+        # policy, not classifier geometry, so they are lifted out before the
+        # rest is handed to BehaviourClassifier - which takes floats only and
+        # would choke on a list.
+        self.alerting_behaviours: frozenset[str] = frozenset(
+            str(name).upper()
+            for name in (behaviour_cfg.pop("alerting_behaviours", None) or [])
+        )
+        self.behaviour_alert_min_confidence = float(
+            behaviour_cfg.pop("alert_min_confidence", 0.55))
+
         self.behaviour_classifier = BehaviourClassifier(
             **{k: float(v) for k, v in behaviour_cfg.items()}
         )
@@ -483,8 +494,8 @@ class SurveillancePipeline:
         # threat, incidents, evidence or alerts.
         # Counted in ANALYSED frames so pose.interval_frames stays
         # independent of detection.frame_stride.
-        self._update_pose(frame, active, self.stats.frames_processed,
-                          moment)
+        fresh_behaviour = self._update_pose(
+            frame, active, self.stats.frames_processed, moment)
 
         # -- zone, line, behaviour, threat -------------------------------
         new_incidents: list[Incident] = []
@@ -508,6 +519,17 @@ class SurveillancePipeline:
             new_incidents.extend(
                 self._analyse_track(track, frame, moment, person_count)
             )
+
+        # -- behaviour on its own ----------------------------------------
+        # Runs AFTER _analyse_track so that a person who is both crouching
+        # and inside a restricted zone has their zone incident raised first;
+        # the incident manager's dedupe window then folds the behaviour into
+        # it instead of producing a second card for the same moment.
+        for track, event in fresh_behaviour:
+            incident = self._raise_behaviour_incident(
+                track, event, frame, moment, person_count)
+            if incident is not None:
+                new_incidents.append(incident)
 
         # -- anomaly on live tracks --------------------------------------
         if self.stats.frames_processed % self._anomaly_check_every == 0:
@@ -542,7 +564,7 @@ class SurveillancePipeline:
         self.stats.incidents += len(new_incidents)
 
         annotated = (
-            self._render(frame, frame_index, moment, active)
+            self._render(frame, frame_index, moment)
             if self.annotate else None
         )
 
@@ -583,6 +605,30 @@ class SurveillancePipeline:
             track.threat_reasons = [r.label for r in assessment.reasons]
         return assessment
 
+    def _event_detail(self, track: TrackState,
+                      extra: dict[str, Any]) -> dict[str, Any]:
+        """The stored detail blob for one incident.
+
+        Whatever the incident type already recorded, plus WHAT THE PERSON
+        WAS DOING when it fired. Without this, a zone intrusion in the
+        detection log could say where somebody was but never what they were
+        doing there, while the Live Monitoring overlay beside it showed the
+        behaviour plainly - the same event described two different ways
+        depending on which page you looked at.
+
+        The behaviour is read off the track at the moment of the incident,
+        so it is the same reading the overlay drew on that person's box on
+        that frame. Nothing is recomputed and nothing is invented: a person
+        whose behaviour is still UNKNOWN is recorded as UNKNOWN.
+        """
+        detail = dict(extra)
+        if track.class_name.lower() in self.person_classes:
+            detail.setdefault("behaviour", track.behaviour)
+            detail.setdefault("behaviour_confidence",
+                              round(float(track.behaviour_confidence), 2))
+            detail.setdefault("boundary_state", track.boundary_state)
+        return detail
+
     def _person_context(self, track: TrackState) -> dict[str, Any]:
         """Person-specific threat inputs shared by every incident type.
 
@@ -595,7 +641,6 @@ class SurveillancePipeline:
         behaviour = track.behaviour
         return {
             "boundary_state": track.boundary_state,
-            "low_profile_movement": behaviour in LOW_PROFILE_MOVEMENT,
             "behaviour": None if behaviour == "UNKNOWN" else behaviour,
         }
 
@@ -641,12 +686,12 @@ class SurveillancePipeline:
                 track_db_id=track.db_id,
                 object_class=track.class_name,
                 zone_name=event.zone.name,
-                detail={
+                detail=self._event_detail(track, {
                     "zone_kind": event.zone.kind,
                     "entry_point": list(event.point),
                     "confidence": round(track.avg_confidence, 3),
                     "features": self.behaviour.describe_features(track, now),
-                },
+                }),
                 session_id=self.session_id,
             )
             self._alert_tracks.add(track.track_number)
@@ -712,7 +757,7 @@ class SurveillancePipeline:
                 track_db_id=track.db_id,
                 object_class=track.class_name,
                 zone_name=crossing.line.name,
-                detail=crossing.to_dict(),
+                detail=self._event_detail(track, crossing.to_dict()),
                 session_id=self.session_id,
             )
             self._alert_tracks.add(track.track_number)
@@ -749,7 +794,7 @@ class SurveillancePipeline:
                 track_db_id=track.db_id,
                 object_class=track.class_name,
                 zone_name=track.zone_name,
-                detail=loiter.to_dict(),
+                detail=self._event_detail(track, loiter.to_dict()),
                 session_id=self.session_id,
             )
             self._alert_tracks.add(track.track_number)
@@ -802,6 +847,88 @@ class SurveillancePipeline:
         zone = self.zone_engine._zone_by_name(track.zone_name)
         return zone is not None and zone.kind == kind
 
+    def _raise_behaviour_incident(
+        self, track: TrackState, event: Any, frame: np.ndarray, now: float,
+        person_count: int,
+    ) -> Optional[Incident]:
+        """Raise an incident for a behaviour that is an event by itself.
+
+        Only for the labels named in `activity.behaviour.alerting_behaviours`.
+        Everything else the classifier produces still reaches the threat
+        engine through :meth:`_person_context` and still raises the score of
+        whatever else is happening - it simply does not start an incident of
+        its own.
+
+        Three separate things keep this from becoming a per-frame siren:
+
+        * the classifier's own debounce, which will not report a behaviour
+          until it has held for `hold_seconds`;
+        * this method being fed only the events that SETTLED this frame,
+          never the accumulated list;
+        * the incident manager's dedupe window, which folds a repeat of the
+          same behaviour on the same track into the existing incident.
+
+        One crouch is therefore one alert, however many frames it spans.
+        """
+        behaviour = str(getattr(event, "behavior", "") or "").upper()
+        if not behaviour or behaviour not in self.alerting_behaviours:
+            return None
+        if track.class_name.lower() not in self.person_classes:
+            return None
+        confidence = float(getattr(event, "confidence", 0.0) or 0.0)
+        if confidence < self.behaviour_alert_min_confidence:
+            return None
+
+        ctx = ThreatContext(
+            # Scene darkness, measured from this frame.
+            low_light=self._low_light_state.low_light,
+            incident_type=IncidentType.SUSPICIOUS_BEHAVIOUR,
+            class_name=track.class_name,
+            in_restricted_zone=self._in_kind(track, ZoneKind.RESTRICTED),
+            in_border_zone=self._in_kind(track, ZoneKind.BORDER),
+            anomaly_detected=track.anomaly_status == STATUS_ANOMALOUS,
+            anomaly_score=track.anomaly_score,
+            group_size=person_count,
+            speed=track.speed,
+            zone_name=track.zone_name,
+            ts=now,
+            **{
+                # The behaviour scored here is the one that just fired, not
+                # whatever the track happens to be doing by the time the
+                # context is built. They are normally the same; when a person
+                # changes posture on the same frame they are not, and the
+                # alert must describe the event it was raised for.
+                **self._person_context(track),
+                "behaviour": behaviour,
+            },
+        )
+        assessment = self._assess(ctx, track)
+        outcome = self.incidents.submit(
+            camera_id=self.camera_id,
+            incident_type=IncidentType.SUSPICIOUS_BEHAVIOUR,
+            assessment=assessment,
+            ts=now,
+            track_number=track.track_number,
+            track_db_id=track.db_id,
+            object_class=track.class_name,
+            zone_name=track.zone_name,
+            detail=self._event_detail(track, {
+                # The behaviour that FIRED, which is what this incident is
+                # about. _event_detail fills in `behaviour` as the plain
+                # label; this keeps the full event beside it - confidence,
+                # duration and the geometry the classifier decided on.
+                "behaviour": behaviour,
+                "behaviour_event": event.to_dict(),
+                "features": self.behaviour.describe_features(track, now),
+            }),
+            session_id=self.session_id,
+        )
+        if outcome.created:
+            self._alert_tracks.add(track.track_number)
+            self._after_incident(outcome.incident, track, frame, now)
+            return outcome.incident
+        return None
+
     def _raise_anomaly_incident(
         self, track: TrackState, result: Any, frame: np.ndarray, now: float
     ) -> Optional[Incident]:
@@ -829,10 +956,10 @@ class SurveillancePipeline:
             track_db_id=track.db_id,
             object_class=track.class_name,
             zone_name=track.zone_name,
-            detail={
+            detail=self._event_detail(track, {
                 "anomaly": result.to_dict(),
                 "features": self.behaviour.describe_features(track, now),
-            },
+            }),
             session_id=self.session_id,
         )
         if outcome.created:
@@ -996,8 +1123,7 @@ class SurveillancePipeline:
         box_px = (box_norm[0] * width, box_norm[1] * height,
                   box_norm[2] * width, box_norm[3] * height)
 
-        annotated = self._render(frame, self.stats.frames_processed, now,
-                                 list(self.tracks.tracks.values()))
+        annotated = self._render(frame, self.stats.frames_processed, now)
         files = self.evidence.capture(
             frame=frame,
             camera_id=self.camera_id,
@@ -1113,7 +1239,7 @@ class SurveillancePipeline:
     def _update_pose(
         self, frame: np.ndarray, active: list[TrackState],
         analysed_frame_count: int, moment: float,
-    ) -> None:
+    ) -> list[tuple[TrackState, Any]]:
         """Attach body keypoints to confirmed person tracks.
 
         Two gates before any inference happens. The interval gate asks whether
@@ -1123,9 +1249,16 @@ class SurveillancePipeline:
 
         Failures here are swallowed deliberately. Pose is an enrichment: if it
         breaks, the operator should lose keypoints, not lose the camera.
+
+        Returns the ``(track, BehaviourEvent)`` pairs the classifier settled
+        on DURING THIS FRAME. ``self.behaviour_events`` accumulates across the
+        run and cannot answer "what is new", which is the only question an
+        alert may be raised from - reading the accumulated list per frame is
+        how a single crouch turns into one alert per frame.
         """
+        fresh: list[tuple[TrackState, Any]] = []
         if not self.pose.should_run(analysed_frame_count):
-            return
+            return fresh
 
         people = [
             track for track in active
@@ -1133,14 +1266,14 @@ class SurveillancePipeline:
             and track.frames_seen >= self.tracks.min_hits
         ]
         if not people:
-            return
+            return fresh
 
         try:
             results = self.pose.estimate(frame, people, moment)
         except Exception as exc:
             logger.error("Pose estimation failed on %s: %s",
                          self.camera_id, exc)
-            return
+            return fresh
 
         for track in people:
             result = results.get(track.track_number)
@@ -1181,6 +1314,7 @@ class SurveillancePipeline:
                 track.behaviour_duration = state.duration
             if event is not None:
                 self.behaviour_events.append(event)
+                fresh.append((track, event))
                 logger.info("%s %s", self.camera_id, event.describe())
 
         # Histories and behaviour states outlive a single frame, so they must
@@ -1190,6 +1324,7 @@ class SurveillancePipeline:
         self.pose_history.prune(live)
         self.behaviour_classifier.prune(live)
         self.boundary.prune(live)
+        return fresh
 
     def _update_boundary(self, track: TrackState, now: float,
                          crossed: bool,
@@ -1311,6 +1446,40 @@ class SurveillancePipeline:
             })
         return rows
 
+    def session_totals(self) -> dict[str, Any]:
+        """What this camera CONCLUDED over the whole run.
+
+        Session totals, not a live snapshot, and the distinction is the
+        whole point. ``persons`` here is how many DIFFERENT people were
+        confirmed at any moment during the run; the ``persons`` in the live
+        stats is how many are in view right now. On a clip where two people
+        walk through and leave, the live figure ends at 0 and this one ends
+        at 2. Reporting the last frame's count as the result of the run
+        would report the emptiness of the final frame.
+
+        Every number comes from a component that already existed:
+
+        * persons / vehicles - distinct identities that reached ``min_hits``
+          in ``TrackManager``, so a person present for 500 frames counts
+          once and a two-frame false positive counts not at all;
+        * alerts / incidents - the pipeline's own counters, which are
+          incremented only when ``IncidentManager`` actually creates an
+          incident, so a threat that persists for 100 frames is one alert
+          and not a hundred. That deduplication is not reimplemented here.
+        """
+        return {
+            "persons": self.tracks.unique_seen(self.person_classes),
+            "vehicles": self.tracks.unique_seen(self.vehicle_classes),
+            "alerts": int(self.stats.alerts),
+            "incidents": int(self.stats.incidents),
+            "detections": int(self.stats.detections),
+            "evidence": int(self.stats.evidence_files),
+            "plates": int(self.stats.plates_read),
+            "frames_read": int(self.stats.frames_read),
+            "frames_processed": int(self.stats.frames_processed),
+            "unique_by_class": self.tracks.unique_breakdown(),
+        }
+
     # ------------------------------------------------------------------
     # Security geometry, read by the API stats and the GUI status panel
     # ------------------------------------------------------------------
@@ -1361,7 +1530,31 @@ class SurveillancePipeline:
         self, frame: np.ndarray, frame_index: int, ts: float,
         tracks: Optional[list[TrackState]] = None,
     ) -> np.ndarray:
-        live = tracks if tracks is not None else list(self.tracks.tracks.values())
+        """Draw the overlay. ``tracks`` is accepted but deliberately unused.
+
+        See the comment on ``live`` below: what gets drawn is decided here,
+        from ``confirmed()``, and not by the caller.
+        """
+        # CONFIRMED tracks only, always. The overlay must show the same set
+        # of objects the rest of the system believes in.
+        #
+        # It did not, and that was the whole of the "a pole is detected as a
+        # person" bug. This function used to be handed `active` (every track
+        # matched THIS frame, including ones below min_hits) or the raw
+        # `self.tracks.tracks` dict (every live track, including ones that
+        # stopped matching detections a second ago), while counts, incidents,
+        # threat scoring, the API and the database all used `confirmed()`.
+        #
+        # Measured on CAM-01: one 0.35-confidence detection on a fence post,
+        # seen TWICE and never again, was drawn as "PERSON #03" for 34
+        # consecutive frames from frame 222 onward - `frames_seen=2` against
+        # `min_hits=3`, `missed_frames=30`. The HUD beside it correctly read
+        # PERSONS 1. Detection, tracking and confirmation were all behaving;
+        # only the picture disagreed with them.
+        #
+        # Passing a wider list in is now ignored on purpose rather than
+        # trusted, so no future call site can reintroduce the mismatch.
+        live = self.tracks.confirmed()
         hud = {
             "camera_id": self.camera_id,
             "timestamp": time.strftime("%H:%M:%S", time.localtime(ts)),

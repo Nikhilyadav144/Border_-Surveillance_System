@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from pathlib import Path
@@ -9,10 +10,15 @@ from typing import Any
 import anyio
 import cv2
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
+from api import deps
+from api.auth_routes import admin_router, auth_router
+from api.deps import AuthSettings
+from core.auth import AuditAction, Principal
 from core.config import load_config
 from core.pipeline import SurveillancePipeline
 from database.database import Database
@@ -45,6 +51,41 @@ STREAM_FIRST_FRAME_TIMEOUT = 10.0
 #: Target pacing for the MJPEG stream. The camera thread produces frames at
 #: its own rate; this only decides how often the stream checks for a new one.
 STREAM_INTERVAL = 0.03
+
+#: Stats that describe THIS RUN of a camera, and nothing else.
+#
+# They are zeroed when a camera starts and again when it stops, so a stopped
+# camera reads zero and a restarted one begins from zero rather than
+# inheriting the last session. Without this, CAM-01 sat at OFFLINE while
+# still reporting "alerts 3, incidents 3, detections 120" from a run that had
+# already finished - measured, not hypothetical.
+#
+# The cumulative history is NOT lost: every alert, incident and evidence file
+# is in the database with its camera_id, and /api/alerts, /api/incidents and
+# the `database` block of /api/dashboard still serve it. Live state and
+# historical state are different questions and now have different sources.
+LIVE_COUNTER_KEYS = {
+    "frame_index": 0,
+    "persons": 0,
+    "vehicles": 0,
+    "tracks": 0,
+    "detections": 0,
+    "incidents": 0,
+    "alerts": 0,
+    "evidence": 0,
+    "plates": 0,
+    "poses": 0,
+    "fps": 0.0,
+    "inference_ms": 0.0,
+    "pose_ms": 0.0,
+    # Scene measurements, not configuration. A camera that is not running has
+    # not measured anything, so it says so instead of reporting the light it
+    # saw last time.
+    "low_light": False,
+    "luminance": None,
+    "night_context": "Not started",
+    "pose": "Not started",
+}
 
 
 @app.on_event("startup")
@@ -82,6 +123,21 @@ db = Database(
     config.path("database_file")
 )
 
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+#
+# Wired here, at the edge, and nowhere else. `core/` is untouched: no engine
+# knows a user exists, and the pipeline behaves identically whether the
+# users table has one row or none. Authentication decides who may call the
+# API; it has no opinion about what the API then does.
+#
+# The routers are mounted at the bottom of this module, after every existing
+# endpoint has been defined.
+
+auth_settings = AuthSettings.from_config(config)
+deps.configure(db, auth_settings)
+
 
 # ============================================================
 # CAMERA RUNTIME
@@ -112,6 +168,19 @@ class CameraRuntime:
         #: Wall time the newest frame was encoded, so a client can tell a
         #: live feed from a frozen one.
         self.latest_frame_ts: float = 0.0
+
+        #: The CONCLUDED result of the last completed run of this camera.
+        #:
+        #: None until this camera has finished a run. Survives the camera
+        #: going OFFLINE - that is the point of it - and is replaced, never
+        #: added to, when a new run completes. Belongs to this runtime only,
+        #: so CAM-02 finishing cannot touch CAM-01's result.
+        self.final_stats: dict[str, Any] | None = None
+        #: NEVER_RUN / PROCESSING / COMPLETED / STOPPED / ERROR.
+        #: Answers "can I trust the numbers on this card yet", which the
+        #: live status cannot: a camera is OFFLINE both before its first run
+        #: and after a finished one, and those mean different things.
+        self.result_status: str = "NEVER_RUN"
 
         self.stats = {
             "camera_id": self.camera_id,
@@ -164,6 +233,14 @@ class CameraRuntime:
                 else round(time.time() - self.latest_frame_ts, 2)
             )
         data["frame_age"] = age
+        data["result_status"] = self.result_status
+        data["final"] = self.final_stats
+        # WHICH RUN this camera is on, or was last on. None until it has
+        # started once. Detection Logs scopes its event list to this, so a
+        # camera that has never run in this process shows no events rather
+        # than events from a session somebody ran yesterday - which would
+        # sit under a "NOT YET RUN" heading and contradict it.
+        data["session_id"] = self.session_id
         if data["status"] in ("OFFLINE", "ERROR"):
             data["stream"] = "IDLE"
         elif age is None:
@@ -177,6 +254,67 @@ class CameraRuntime:
     def _set(self, **values: Any) -> None:
         with self.lock:
             self.stats.update(values)
+
+    def reset_live_stats(self) -> None:
+        """Zero everything that describes a single run of this camera.
+
+        Called on START so a restart never inherits the previous session,
+        and on STOP so a camera that is not running reports zero. Only this
+        runtime is touched, so stopping CAM-01 cannot disturb CAM-02.
+        """
+        with self.lock:
+            self.stats.update(LIVE_COUNTER_KEYS)
+            self.latest_frame = None
+            self.latest_frame_ts = 0.0
+
+    def _finalise_run(self) -> None:
+        """Conclude the run and keep the result for the dashboard card.
+
+        Reads `SurveillancePipeline.session_totals()`, which counts DISTINCT
+        confirmed identities rather than what happened to be in the last
+        frame. A clip where ten people walk through and two remain at the
+        end concludes with ten, not two.
+
+        Only replaces a previous result, never accumulates onto it: running
+        a camera twice reports the second run's numbers, not their sum.
+        """
+        pipeline = self.pipeline
+        if pipeline is None:
+            # Never got as far as building a pipeline; nothing was analysed,
+            # so there is no result to report and the old one stands.
+            return
+        try:
+            totals = pipeline.session_totals()
+        except Exception as exc:
+            print(f"[{self.camera_id}] could not finalise: {exc}")
+            return
+
+        with self.lock:
+            ended = bool(self.stats.get("source_ended"))
+            errored = self.stats.get("status") == "ERROR"
+
+        self.final_stats = {
+            "camera_id": self.camera_id,
+            **totals,
+            # WHICH run these numbers describe. Detection Logs uses it to
+            # pull exactly this session's events, so re-running a camera
+            # shows the new run's events beside the new run's totals rather
+            # than every event the camera has ever produced.
+            "session_id": self.session_id,
+            "finished_ts": time.time(),
+            # How the run ended, because "3 people" from a clip that played
+            # out means something different from "3 people" from a clip the
+            # operator cut short after two seconds.
+            "completed": ended,
+        }
+        self.result_status = (
+            "ERROR" if errored else "COMPLETED" if ended else "STOPPED"
+        )
+        print(f"[{self.camera_id}] run concluded: "
+              f"{totals['persons']} unique person(s), "
+              f"{totals['vehicles']} vehicle(s), "
+              f"{totals['alerts']} alert(s) "
+              f"over {totals['frames_processed']} analysed frames")
 
     @property
     def is_live(self) -> bool:
@@ -198,15 +336,17 @@ class CameraRuntime:
 
             self.stop_event.clear()
 
-            # A restart must not inherit the last run's picture, or the
-            # stream shows a stale frame from the previous session and a
-            # client cannot tell it apart from a live one.
-            with self.lock:
-                self.latest_frame = None
-                self.latest_frame_ts = 0.0
+            # A restart must inherit nothing from the last run: not the
+            # picture, or the stream shows a stale frame a client cannot
+            # tell from a live one, and not the counters, or CAM-01 appears
+            # to have already raised three alerts the moment it starts.
+            self.reset_live_stats()
+            # A new run is under way, so the previous conclusion no longer
+            # describes what is happening. The card shows PROCESSING rather
+            # than last run's numbers, which would read as this run's.
+            self.result_status = "PROCESSING"
 
-            self._set(status="STARTING", error=None, source_ended=False,
-                      frame_index=0)
+            self._set(status="STARTING", error=None, source_ended=False)
 
             self.thread = threading.Thread(
                 target=self._run,
@@ -227,6 +367,9 @@ class CameraRuntime:
             if self.thread and self.thread.is_alive():
                 self.thread.join(timeout=5)
 
+            # Reset first, then set the status, so a client polling in
+            # between never sees OFFLINE next to last session's numbers.
+            self.reset_live_stats()
             self._set(status="OFFLINE")
 
     # --------------------------------------------------------
@@ -462,6 +605,14 @@ class CameraRuntime:
                         f"Finalisation error: {exc}"
                     )
 
+            # THE COMPLETION POINT. The source ended, the operator stopped
+            # the camera, or the thread is unwinding after an error. Before
+            # the live counters are cleared, conclude the run: this is the
+            # only moment at which the whole session is still in memory.
+            self._finalise_run()
+
+            # The run is over, so its live counters are over with it.
+            self.reset_live_stats()
             self._set(status="OFFLINE")
             self.stop_event.set()
 
@@ -552,13 +703,43 @@ for camera in cameras:
 # HEALTH
 # ============================================================
 
+# The compiled dashboard, if it has been built. `npm run build` writes it;
+# `npm run dev` does not. Resolved once, at import, because the answer cannot
+# change while the process is alive.
+FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+FRONTEND_INDEX = FRONTEND_DIST / "index.html"
+
+
 @app.get("/")
 async def root():
+    """The dashboard when it has been built, otherwise a status document.
+
+    WHY THE BACKEND SERVES THE FRONTEND
+    -----------------------------------
+    Running `uvicorn` and `npm run dev` side by side means two processes, two
+    ports and two chances for one of them to be stale. That is not a
+    hypothetical: a uvicorn left running from before an endpoint existed has
+    already produced two separate "the app is broken" reports on this project,
+    both of which were really "the old server is still up". One process cannot
+    disagree with itself.
+
+    The JSON fallback is kept for the case where nobody has built the frontend
+    yet, so a fresh clone still answers on `/` instead of 404-ing, and says
+    what to do about it.
+    """
+    if FRONTEND_INDEX.is_file():
+        # no-store: the HTML names hashed asset files. If a browser keeps an
+        # old copy of *this* document it will ask for assets that a rebuild has
+        # already renamed. The assets themselves are content-hashed and cached
+        # hard by the mount below; only this one entry point must stay fresh.
+        return FileResponse(FRONTEND_INDEX, headers={"Cache-Control": "no-store"})
 
     return {
         "name": "Border Guard AI",
         "status": "online",
         "version": "1.0.0",
+        "dashboard": "not built",
+        "hint": "Run `npm run build` in frontend/ to serve the dashboard here.",
     }
 
 
@@ -576,7 +757,7 @@ async def health():
 # ============================================================
 
 @app.get("/api/cameras")
-async def get_cameras():
+async def get_cameras(_user: Principal = Depends(deps.require_user)):
 
     result = []
 
@@ -619,7 +800,10 @@ async def get_cameras():
 # ============================================================
 
 @app.post("/api/cameras/{camera_id}/start")
-async def start_camera(camera_id: str):
+async def start_camera(
+    camera_id: str,
+    _user: Principal = Depends(deps.require_camera_control),
+):
 
     if camera_id not in runtimes:
         raise HTTPException(
@@ -643,7 +827,10 @@ async def start_camera(camera_id: str):
 # ============================================================
 
 @app.post("/api/cameras/{camera_id}/stop")
-async def stop_camera(camera_id: str):
+async def stop_camera(
+    camera_id: str,
+    _user: Principal = Depends(deps.require_camera_control),
+):
 
     if camera_id not in runtimes:
         raise HTTPException(
@@ -667,7 +854,7 @@ async def stop_camera(camera_id: str):
 # ============================================================
 
 @app.get("/api/cameras/{camera_id}/stats")
-async def camera_stats(camera_id: str):
+async def camera_stats(camera_id: str, _user: Principal = Depends(deps.require_user)):
 
     if camera_id not in runtimes:
         raise HTTPException(
@@ -683,7 +870,7 @@ async def camera_stats(camera_id: str):
 # ============================================================
 
 @app.get("/api/cameras/{camera_id}/tracks")
-async def camera_tracks(camera_id: str):
+async def camera_tracks(camera_id: str, _user: Principal = Depends(deps.require_user)):
     """One row per tracked person, with what the pipeline concluded.
 
     Small on purpose. This is polled alongside the stats, so it carries the
@@ -805,7 +992,29 @@ async def generate_stream(runtime: CameraRuntime):
 
 
 @app.get("/api/cameras/{camera_id}/stream")
-async def camera_stream(camera_id: str):
+async def camera_stream(camera_id: str, request: Request,
+                        token: str | None = None):
+    """The live MJPEG feed. Authenticated, but not by a header.
+
+    A browser loads this through an `<img src="...">`, and it will not put an
+    Authorization header on an image request. The choice is a query token or
+    an unauthenticated video feed, and an unauthenticated feed is not a
+    choice: the URL is guessable and would hand anybody the cameras.
+
+    The token is the same session token and is validated exactly the same
+    way. The cost is that it appears in the server's access log, which is
+    why this is the ONLY route that accepts one this way - everything else
+    requires the header.
+    """
+    principal = deps.resolve_principal(request)
+    if principal is None and token:
+        principal = deps.principal_from_token(token)
+    if principal is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated. Please sign in.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     if camera_id not in runtimes:
         raise HTTPException(
@@ -833,7 +1042,7 @@ async def camera_stream(camera_id: str):
 # ============================================================
 
 @app.get("/api/dashboard")
-async def dashboard():
+async def dashboard(_user: Principal = Depends(deps.require_user)):
 
     active_cameras = 0
     persons = 0
@@ -843,30 +1052,58 @@ async def dashboard():
     incidents = 0
     alerts = 0
 
+    # Per-camera rows, so a client never has to reconstruct which camera
+    # contributed what. The fleet totals below are a SUM of exactly these
+    # rows and nothing else.
+    per_camera = {}
+
     for runtime in runtimes.values():
 
         stats = runtime.snapshot()
+        running = stats["status"] == "ONLINE"
 
-        if stats["status"] == "ONLINE":
+        # Only a RUNNING camera contributes to the live totals. A stopped
+        # camera has no live state, and counting its last session made the
+        # dashboard read "0 cameras active, 3 alerts, 120 detections", which
+        # is a sentence that cannot be true.
+        if running:
             active_cameras += 1
+            persons += int(stats["persons"])
+            vehicles += int(stats["vehicles"])
+            tracks += int(stats["tracks"])
+            detections += int(stats["detections"])
+            incidents += int(stats["incidents"])
+            alerts += int(stats["alerts"])
 
-        persons += int(stats["persons"])
-        vehicles += int(stats["vehicles"])
-        tracks += int(stats["tracks"])
-        detections += int(stats["detections"])
-        incidents += int(stats["incidents"])
-        alerts += int(stats["alerts"])
+        per_camera[runtime.camera_id] = {
+            "camera_id": runtime.camera_id,
+            "status": stats["status"],
+            "stream": stats["stream"],
+            "running": running,
+            "persons": int(stats["persons"]),
+            "vehicles": int(stats["vehicles"]),
+            "tracks": int(stats["tracks"]),
+            "detections": int(stats["detections"]),
+            "incidents": int(stats["incidents"]),
+            "alerts": int(stats["alerts"]),
+        }
 
     database_counts = db.analytics_counts()
 
     return {
+        # LIVE: the cameras running right now, and nothing else.
         "cameras_active": active_cameras,
+        "cameras_total": len(runtimes),
         "persons": persons,
         "vehicles": vehicles,
         "tracks": tracks,
         "detections": detections,
         "incidents": incidents,
         "alerts": alerts,
+        "per_camera": per_camera,
+        # HISTORICAL: everything ever recorded, from the database, with its
+        # own camera_id on every row. Deliberately a separate block so the
+        # two can never be mistaken for one another.
         "database": database_counts,
     }
 
@@ -876,7 +1113,7 @@ async def dashboard():
 # ============================================================
 
 @app.get("/api/alerts")
-def alerts():
+def alerts(_user: Principal = Depends(deps.require_user)):
 
     rows = db.get_alerts(
         limit=100
@@ -893,7 +1130,7 @@ def alerts():
 # ============================================================
 
 @app.get("/api/incidents")
-def incidents():
+def incidents(_user: Principal = Depends(deps.require_user)):
 
     rows = db.get_incidents(
         limit=100
@@ -906,11 +1143,247 @@ def incidents():
 
 
 # ============================================================
+# EVENTS
+# ============================================================
+#
+# The recorded event log behind the Detection Logs page.
+#
+# Every value on a row was written by the Python pipeline at the moment the
+# event happened and read back out of SQLite here. Nothing on this endpoint
+# is computed for display: the threat level is the ThreatEngine's verdict,
+# the timestamp is the processing time of the frame that raised it, the
+# behaviour is what the classifier had concluded for that person on that
+# frame, and `message` is the exact sentence AlertManager showed the
+# operator. React renders these; it does not derive them.
+
+#: Behaviour label -> the short sentence an operator reads. The classifier's
+#: labels are enum-shaped (BENT_RUN) and an operator should not have to
+#: decode them at 3am. Only formatting - no behaviour is invented here, and
+#: a label with no entry falls back to its own words rather than a guess.
+BEHAVIOUR_HEADLINES = {
+    "JUMPING": "Jumping / abnormal movement",
+    "CRAWLING": "Crawling detected",
+    "CROUCHING": "Crouching / suspicious movement",
+    "FALLING": "Person fell",
+    "RUNNING": "Running detected",
+    # The operator's own phrase for this is "running while crouching". It is
+    # what CAM-01's first person actually does and what the classifier
+    # actually calls it, so the sentence says both.
+    "BENT_RUN": "Running while crouched / low movement",
+    "BENT_WALK": "Moving while crouched / low movement",
+    "BENDING": "Bending detected",
+}
+
+#: Incident type -> the short sentence, for events that are not about a
+#: behaviour. Mirrors database.models.IncidentType.LABELS in operator
+#: language; the type itself still travels on every row so a client can tell
+#: exactly which incident this was.
+INCIDENT_HEADLINES = {
+    "restricted_zone_intrusion": "Restricted zone intrusion",
+    "border_zone_intrusion": "Border zone entry",
+    "no_vehicle_zone_violation": "Vehicle in a no-vehicle zone",
+    "line_crossing": "Boundary crossing",
+    "loitering": "Loitering detected",
+    "behavioural_anomaly": "Abnormal movement pattern",
+    "watchlist_match": "Watchlist match",
+    "suspicious_behaviour": "Suspicious behaviour",
+}
+
+
+def _headline(incident_type: str, behaviour: str | None) -> str:
+    """One short line naming what happened.
+
+    A behaviour incident is named by the behaviour, because "Suspicious
+    behaviour" tells an operator nothing they can act on. Everything else is
+    named by its type. Falls back to the raw type rather than to a
+    comfortable-sounding default, so an incident type nobody has written a
+    sentence for is visibly unnamed instead of silently mislabelled.
+    """
+    if incident_type == "suspicious_behaviour" and behaviour:
+        upper = str(behaviour).upper()
+        return BEHAVIOUR_HEADLINES.get(
+            upper, f"{upper.replace('_', ' ').capitalize()} detected")
+    return INCIDENT_HEADLINES.get(
+        incident_type, str(incident_type).replace("_", " ").capitalize())
+
+
+def _event_row(row: Any) -> dict[str, Any]:
+    """One database row as the operator log wants to read it."""
+    data = dict(row)
+
+    detail = {}
+    raw_detail = data.get("detail")
+    if raw_detail:
+        try:
+            detail = json.loads(raw_detail)
+        except (TypeError, ValueError):
+            detail = {}
+
+    reasons = []
+    raw_reasons = data.get("reasons")
+    if raw_reasons:
+        try:
+            reasons = [
+                str(item.get("label", ""))
+                for item in json.loads(raw_reasons)
+                if isinstance(item, dict) and item.get("label")
+            ]
+        except (TypeError, ValueError):
+            reasons = []
+
+    behaviour = detail.get("behaviour")
+    if behaviour == "UNKNOWN":
+        # The classifier never concluded anything for this person. Say so,
+        # rather than sending UNKNOWN for React to dress up as a behaviour.
+        behaviour = None
+
+    ts_text = str(data.get("ts_text") or "")
+    # "2026-09-11 12:31:27" -> "12:31:27". The date is kept on the row for a
+    # client that wants it; the timeline shows the time of day.
+    time_only = ts_text.split(" ")[-1] if ts_text else ""
+
+    return {
+        "incident_id": data.get("incident_id"),
+        "session_id": data.get("session_id"),
+        "camera_id": data.get("camera_id"),
+        "track_id": data.get("track_number"),
+        "object_type": data.get("object_class"),
+        "object_label": data.get("object_label"),
+        "incident_type": data.get("incident_type"),
+        "behaviour": behaviour,
+        # The ThreatEngine's verdict, stored at the moment of the event.
+        "threat_level": data.get("threat_level"),
+        "threat_score": data.get("threat_score"),
+        "headline": _headline(str(data.get("incident_type") or ""), behaviour),
+        # The sentence the operator was actually shown when this fired.
+        # None when the incident raised no alert.
+        "message": data.get("message"),
+        # Why it scored what it scored, in the threat model's own words.
+        "reasons": reasons,
+        "zone_name": data.get("zone_name"),
+        "boundary_state": detail.get("boundary_state"),
+        "status": data.get("status"),
+        "escalation_count": data.get("escalation_count") or 0,
+        "ts": data.get("ts"),
+        "ts_text": ts_text,
+        "time": time_only,
+    }
+
+
+@app.get("/api/events")
+def events(
+    camera_id: str | None = None,
+    session_id: int | None = None,
+    session_ids: str | None = None,
+    limit: int = 200,
+    _user: Principal = Depends(deps.require_user),
+):
+    """Recorded events, newest first.
+
+    Filtering happens in SQL, not in the client, so CAM-01's events cannot
+    be shown under CAM-02 by a mistake in the interface.
+
+    * `camera_id` - one camera's events. Every row still carries its own
+      camera_id, so nothing downstream has to remember what was asked for.
+    * `session_id` - one run of one camera. This is what makes the event
+      list agree with the concluded totals shown beside it: re-running a
+      camera shows the new run's events, not every event it ever produced.
+    * `session_ids` - a comma-separated set, for the consolidated ALL
+      CAMERAS timeline: the current concluded run of every camera, mixed
+      into one list. An empty value returns nothing, because "no camera has
+      concluded a run" is a different answer from "here is the entire
+      history of the database".
+    * neither - everything recorded, for a client that wants the raw log.
+    """
+    parsed: list[int] | None = None
+    if session_ids is not None:
+        parsed = []
+        for piece in session_ids.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                parsed.append(int(piece))
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"session_ids must be integers, got {piece!r}",
+                )
+
+    rows = db.get_events(
+        camera_id=camera_id,
+        session_id=session_id,
+        session_ids=parsed,
+        limit=max(1, min(int(limit), 1000)),
+    )
+    return [_event_row(row) for row in rows]
+
+
+@app.get("/api/cameras/{camera_id}/events")
+def camera_events(
+    camera_id: str,
+    session_id: int | None = None,
+    scope: str = "session",
+    limit: int = 200,
+    _user: Principal = Depends(deps.require_user),
+):
+    """One camera's recorded events.
+
+    Alongside /api/cameras/{id}/stats and /api/cameras/{id}/tracks, so a
+    client asking about one camera asks the same shape of question every
+    time and the camera filter is part of the URL rather than a parameter
+    that can be forgotten.
+
+    `scope` decides WHICH run:
+
+    * "session" (default) - the run this camera is on or was last on. This
+      is what makes the event list agree with the concluded totals: a
+      camera that has never run in this process returns nothing, rather
+      than events from a session somebody ran days ago.
+    * "all" - everything this camera has ever recorded.
+
+    An explicit `session_id` overrides both.
+    """
+    runtime = runtimes.get(camera_id)
+    if runtime is None:
+        raise HTTPException(status_code=404,
+                            detail=f"Unknown camera {camera_id}")
+
+    if session_id is None and scope != "all":
+        session_id = runtime.session_id
+        if session_id is None:
+            # Configured, never run in this process. No run means no events
+            # from this run - and saying so is not the same as silently
+            # widening the query to the camera's whole history.
+            return {
+                "camera_id": camera_id,
+                "scope": scope,
+                "session_id": None,
+                "count": 0,
+                "events": [],
+            }
+
+    rows = db.get_events(
+        camera_id=camera_id,
+        session_id=session_id,
+        limit=max(1, min(int(limit), 1000)),
+    )
+    events_out = [_event_row(row) for row in rows]
+    return {
+        "camera_id": camera_id,
+        "scope": scope,
+        "session_id": session_id,
+        "count": len(events_out),
+        "events": events_out,
+    }
+
+
+# ============================================================
 # PLATES
 # ============================================================
 
 @app.get("/api/plates")
-def plates():
+def plates(_user: Principal = Depends(deps.require_user)):
 
     rows = db.get_plates(
         limit=100
@@ -920,3 +1393,41 @@ def plates():
         dict(row)
         for row in rows
     ]
+
+# ============================================================
+# AUTHENTICATION ROUTES
+# ============================================================
+#
+# Mounted last, after every surveillance endpoint above has been defined, so
+# the ordering of this file reads the way the system is layered: the
+# pipeline's API first, the access control around it afterwards.
+#
+# `/api/health` and `/` stay open deliberately. The login screen needs to say
+# whether the backend is reachable BEFORE anybody has a token, and a health
+# check that requires a session cannot answer the one question it exists for.
+# Neither route exposes anything about the cameras, the footage or the users.
+
+app.include_router(auth_router)
+app.include_router(admin_router)
+
+
+# ============================================================
+# THE COMPILED DASHBOARD
+# ============================================================
+#
+# Mounted after EVERY route above, and that ordering is load-bearing. Starlette
+# matches routes in registration order, so a catch-all mounted at "/" put any
+# earlier would swallow "/api/..." and serve a 404 page where JSON belongs.
+# Declared last, it only ever sees requests that matched nothing else.
+#
+# html=True makes the mount serve index.html for a bare directory request.
+#
+# If the dashboard has not been built there is nothing to mount, and the JSON
+# fallback on "/" above explains that instead.
+
+if FRONTEND_DIST.is_dir():
+    app.mount(
+        "/",
+        StaticFiles(directory=FRONTEND_DIST, html=True),
+        name="dashboard",
+    )

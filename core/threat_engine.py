@@ -34,6 +34,11 @@ from database.models import ThreatLevel, ThreatReason
 
 logger = logging.getLogger(__name__)
 
+
+def _humanise(behaviour: str) -> str:
+    """BENT_RUN -> "Bent run", so an operator reads English not an enum."""
+    return str(behaviour).replace("_", " ").capitalize()
+
 #: Shown in the GUI wherever a score is displayed.
 DISCLAIMER = (
     "Prototype risk model. Weights are configurable engineering defaults, "
@@ -86,13 +91,17 @@ class ThreatContext:
     #: is paid.
     boundary_state: str = "NONE"
 
-    #: The person was travelling with their torso folded well off vertical.
-    #: Context, not an incident: it raises the score of whatever else is
-    #: happening rather than firing on its own. Somebody jogging bent into
-    #: the wind produces this too, which is exactly why it does not alert by
-    #: itself.
-    low_profile_movement: bool = False
-    #: The behaviour label behind that flag, for the operator-facing reason.
+    #: WHAT THE PERSON IS DOING, as core/behaviour_classifier.py last
+    #: classified it: JUMPING, CROUCHING, BENT_RUN, WALKING and so on.
+    #: Priced by the ``behaviour.weights`` table in threat_rules.yaml, so the
+    #: risk model reads the same label the operator sees on the box.
+    #:
+    #: This field used to be accompanied by a `low_profile_movement` boolean
+    #: that covered only BENT_WALK and BENT_RUN, and the label itself was
+    #: nothing but a suffix on that one reason. Every other behaviour - a
+    #: person vaulting a fence included - scored zero. The weights table
+    #: replaces the boolean; BENT_WALK keeps that factor's old weight of 15
+    #: so nothing silently changed price in the swap.
     behaviour: Optional[str] = None
 
     ts: Optional[float] = None
@@ -207,6 +216,27 @@ class ThreatEngine:
 
     # -- scoring ----------------------------------------------------------
 
+    def _behaviour_weight(self, behaviour: Optional[str]) -> float:
+        """Points for a classified behaviour, from threat_rules.yaml.
+
+        An unknown behaviour name scores ZERO rather than a default. A
+        classifier that gains a new label must have it priced deliberately;
+        silently guessing a weight for it would move real scores without
+        anybody deciding to.
+        """
+        if not behaviour:
+            return 0.0
+        section = self.factors.get("behaviour")
+        if not isinstance(section, dict):
+            return 0.0
+        weights = section.get("weights")
+        if not isinstance(weights, dict):
+            return 0.0
+        try:
+            return float(weights.get(str(behaviour).upper(), 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
     def assess(self, ctx: ThreatContext) -> ThreatAssessment:
         """Score one context. Pure: same input, same output."""
         reasons: list[ThreatReason] = []
@@ -247,10 +277,20 @@ class ThreatEngine:
             add("boundary_interacting", "Physically engaging with the "
                                         "security boundary")
 
-        if ctx.low_profile_movement:
-            suffix = f" ({ctx.behaviour})" if ctx.behaviour else ""
-            add("low_profile_movement", "Moving while bent over",
-                suffix=suffix)
+        # WHAT THE PERSON IS DOING. One weighted table in threat_rules.yaml,
+        # keyed by the behaviour names core/behaviour_classifier.py emits.
+        #
+        # Before this existed, behaviour reached the scorer only as a label
+        # attached to another factor, so a person classified JUMPING scored
+        # nothing unless they also crossed a line or entered a zone. The
+        # overlay said JUMPING and the risk model knew nothing about it.
+        behaviour_points = self._behaviour_weight(ctx.behaviour)
+        if behaviour_points > 0 and ctx.behaviour:
+            reasons.append(ThreatReason(
+                code=f"behaviour_{str(ctx.behaviour).lower()}",
+                label=f"{_humanise(ctx.behaviour)} detected",
+                points=behaviour_points,
+            ))
 
         if ctx.loitering:
             add("loitering", "Loitering",

@@ -271,3 +271,137 @@ class TestFeatures:
         vector = BehaviourEngine.features_from_row({"avg_speed": None})
         assert np.all(np.isfinite(vector))
         assert vector[0] == 0.0
+
+
+class TestOverlayShowsOnlyConfirmedTracks:
+    """The picture must agree with the rest of the system.
+
+    Regression, CAM-01. A single 0.35-confidence detection on a fence post
+    was seen TWICE and never again, yet it was drawn as "PERSON #03" for 34
+    consecutive frames from frame 222 onward, while the HUD beside it
+    correctly read PERSONS 1.
+
+    Nothing was wrong with YOLO, the thresholds or the tracker: the track
+    had frames_seen=2 against min_hits=3 and missed_frames=30, so it was
+    never confirmed, never counted, never scored and never sent to the API.
+    Only the renderer disagreed, because it was handed `active` (every track
+    matched this frame) or the raw track dict (every live track) instead of
+    `confirmed()`.
+    """
+
+    def test_a_track_below_min_hits_is_never_confirmed(self):
+        manager = TrackManager("CAM-01", min_hits=3, coast_frames=5)
+        # Exactly the CAM-01 case: two detections, then nothing.
+        observe(manager, 3, 0.348, 0.561, 1.0)
+        observe(manager, 3, 0.348, 0.561, 2.0)
+        assert manager.get(3) is not None, "the track exists"
+        assert manager.get(3).frames_seen == 2
+        assert manager.confirmed() == [], "2 hits must not reach the overlay"
+
+        # And it must not become confirmed merely by surviving.
+        for step in range(4):
+            manager.update([], ts=3.0 + step)
+        assert manager.confirmed() == []
+
+    def test_the_renderer_reads_from_confirmed(self):
+        """Source check, because the bug was a wiring mistake.
+
+        A behavioural test cannot catch a future call site passing a wider
+        list back in, so the property is asserted where it lives.
+        """
+        from pathlib import Path
+        source = (Path(__file__).resolve().parents[1]
+                  / "core" / "pipeline.py").read_text()
+        render = source.split("def _render(")[1].split("def ")[0]
+        assert "self.tracks.confirmed()" in render, (
+            "the overlay must source its tracks from confirmed()"
+        )
+        assert "list(self.tracks.tracks.values())" not in render, (
+            "the overlay must not fall back to every live track"
+        )
+
+    def test_a_real_track_that_keeps_being_seen_is_drawn(self):
+        """The other half: this must not suppress genuine people.
+
+        A person who stands perfectly still keeps being detected, so their
+        frames_seen keeps climbing and they stay confirmed. Stationary is
+        not the same as unconfirmed, and only the second one is filtered.
+        """
+        manager = TrackManager("CAM-01", min_hits=3, coast_frames=5)
+        for step in range(40):
+            observe(manager, 7, 0.5, 0.5, float(step))   # never moves
+        confirmed = manager.confirmed()
+        assert len(confirmed) == 1
+        assert confirmed[0].track_number == 7
+        assert confirmed[0].distance_norm == pytest.approx(0.0, abs=1e-9)
+
+
+class TestUniqueSessionCounting:
+    """Session totals, which are not live counts and not frame tallies.
+
+    The dashboard card answers "what did this camera conclude over the whole
+    run", which is a different question from "how many are in view now". A
+    person present for 500 frames is one person; a person who walked through
+    at the start and left still counts.
+    """
+
+    def test_one_person_over_many_frames_counts_once(self):
+        manager = TrackManager("CAM-01", min_hits=3)
+        for step in range(500):
+            observe(manager, 17, 0.5, 0.5, float(step))
+        assert manager.unique_seen({"person"}) == 1
+        assert manager.count_class({"person"}) == 1
+
+    def test_people_who_have_left_are_still_counted(self):
+        """The reason the last frame cannot be the answer."""
+        manager = TrackManager("CAM-01", min_hits=3, coast_frames=2)
+        for track_id in (17, 21, 25):
+            for step in range(5):
+                observe(manager, track_id, 0.5, 0.5, float(step))
+        # Everybody leaves.
+        for step in range(10):
+            manager.update([], ts=100.0 + step)
+        assert manager.count_class({"person"}) == 0, "nobody is in view"
+        assert manager.unique_seen({"person"}) == 3, "but three came through"
+
+    def test_an_unconfirmed_flicker_is_not_a_person(self):
+        """The pole again.
+
+        `total_created` counts every identity the tracker ever opened,
+        including the two-hit detection on a fence post. A unique-people
+        figure built on it would be inflated by exactly the false positives
+        the confirmation rule exists to reject.
+        """
+        manager = TrackManager("CAM-01", min_hits=3)
+        observe(manager, 3, 0.348, 0.561, 1.0)
+        observe(manager, 3, 0.348, 0.561, 2.0)
+        assert manager.total_created == 1
+        assert manager.unique_seen({"person"}) == 0
+
+    def test_persons_and_vehicles_are_counted_separately(self):
+        manager = TrackManager("CAM-01", min_hits=3)
+        for step in range(5):
+            observe(manager, 1, 0.2, 0.5, float(step), class_name="person")
+            observe(manager, 2, 0.4, 0.5, float(step), class_name="person")
+            observe(manager, 101, 0.6, 0.5, float(step), class_name="car")
+        assert manager.unique_seen({"person"}) == 2
+        assert manager.unique_seen({"car", "truck"}) == 1
+        assert manager.unique_breakdown() == {"person": 2, "car": 1}
+
+    def test_a_relabelled_track_is_counted_under_its_final_class(self):
+        manager = TrackManager("CAM-01", min_hits=3)
+        for step in range(4):
+            observe(manager, 5, 0.5, 0.5, float(step), class_name="car")
+        for step in range(4, 8):
+            observe(manager, 5, 0.5, 0.5, float(step), class_name="truck")
+        assert manager.unique_seen({"car"}) == 0
+        assert manager.unique_seen({"truck"}) == 1
+        assert sum(manager.unique_breakdown().values()) == 1, "still one object"
+
+    def test_reset_clears_the_session_ledger(self):
+        manager = TrackManager("CAM-01", min_hits=3)
+        for step in range(5):
+            observe(manager, 1, 0.5, 0.5, float(step))
+        assert manager.unique_seen({"person"}) == 1
+        manager.reset()
+        assert manager.unique_seen({"person"}) == 0

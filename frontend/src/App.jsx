@@ -1,7 +1,27 @@
-import { useEffect, useMemo, useState } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import "./App.css";
 
-const API = "http://127.0.0.1:8000";
+// WHERE THE BACKEND IS
+// --------------------
+// There are two ways this page gets loaded, and they need different answers.
+//
+//   Vite dev server (port 5173)  the backend is a *different* origin, so every
+//                                request needs the absolute address and has to
+//                                clear the CORS allowlist in api/server.py.
+//   FastAPI itself (port 8000)   the backend served this very file, so it is
+//                                the *same* origin. An empty prefix makes every
+//                                request relative: no CORS, no second port,
+//                                and no second process to go stale.
+//
+// Deciding this at runtime rather than at build time means one bundle works in
+// both places, so the production build cannot drift from the dev build.
+const API = window.location.port === "5173" ? "http://127.0.0.1:8000" : "";
 
 const EMPTY_STATS = {
   persons: 0,
@@ -20,8 +40,508 @@ const EMPTY_STATS = {
   status: "OFFLINE",
 };
 
-function App() {
+// ============================================================
+// AUTHENTICATION
+// ============================================================
+//
+// Everything below the line is a gate in front of the existing dashboard,
+// not a change to it. No page, no camera call and no rendering logic was
+// rewritten: requests gained a header, the navigation gained a filter, and
+// the whole app gained a sign-in screen in front of it.
+//
+// The important thing this file does NOT do is decide permissions. React
+// hides what a normal user may not use, because showing somebody a button
+// that will refuse them is bad interface design - but hiding is all it is.
+// Every admin route is refused by the backend independently, so typing a URL
+// or editing this bundle in devtools gains nothing. The frontend is a
+// convenience over the rule; the backend IS the rule.
+
+//: Where the session token lives.
+//
+// sessionStorage, not localStorage: it is cleared when the tab closes, so a
+// session cannot outlive the browsing session on a shared terminal. Not a
+// plain variable either, because that would sign the operator out on every
+// page refresh, which during a demonstration is worse than useless.
+//
+// Wrapped in try/catch throughout: a private window or blocked site data
+// makes these throw, and an inaccessible store should cost a convenience,
+// not crash the application.
+//: Whether the signed-in user may control cameras, shared with the camera
+//: cards without threading a prop through every component between them.
+//
+// Presentation only. Hiding a START button does not stop the request; the
+// backend refuses it for a normal user whatever this says.
+const AccessContext = createContext({ canControl: false });
+const useAccess = () => useContext(AccessContext);
+
+const TOKEN_KEY = "ibvap.session";
+
+function readToken() {
+  try {
+    return sessionStorage.getItem(TOKEN_KEY) || null;
+  } catch {
+    return memoryToken;
+  }
+}
+
+// The fallback for when sessionStorage is unavailable. The app still works;
+// a refresh just returns you to the login screen.
+let memoryToken = null;
+
+function writeToken(token) {
+  memoryToken = token;
+  try {
+    if (token) sessionStorage.setItem(TOKEN_KEY, token);
+    else sessionStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // Held in memoryToken above.
+  }
+}
+
+//: Called when the backend says the session is gone. Installed by the auth
+//: gate so that any request, anywhere in the app, can trigger a sign-out
+//: without every component needing to know how.
+let onSessionLost = () => {};
+
+/**
+ * fetch, with the session token attached and 401 handled once.
+ *
+ * Every API call in this file goes through here. That is the point: a
+ * request that forgot the header would get a 401 and look like a backend
+ * outage, and the bug would be invisible until a demo.
+ */
+async function apiFetch(url, options = {}) {
+  const token = readToken();
+  const headers = { ...(options.headers || {}) };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const response = await fetch(url, { ...options, headers });
+
+  // 401 means the session is over - expired, revoked, or the account was
+  // disabled while it was open. Handled centrally so the operator gets one
+  // clear "session expired" screen instead of every panel failing on its own.
+  if (response.status === 401 && token) {
+    writeToken(null);
+    onSessionLost("SESSION_EXPIRED");
+  }
+  return response;
+}
+
+/** The stream URL, which cannot carry a header. */
+function streamUrl(cameraId) {
+  // An <img> tag will not send an Authorization header, so the one route
+  // that a browser loads as an image takes the token as a query parameter.
+  // The backend validates it exactly as it validates the header.
+  const token = readToken();
+  const base = `${API}/api/cameras/${cameraId}/stream`;
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+}
+
+// ============================================================
+// WHAT EACH ROLE MAY SEE
+// ============================================================
+//
+// The single source of truth for navigation. A page absent from a role's
+// list is never rendered and never reachable from the sidebar - and, far
+// more importantly, the endpoints behind it refuse that role anyway.
+
+const ADMIN_ONLY_PAGES = new Set([
+  "Camera Management",
+  "User Management",
+  "System Settings",
+  "Audit Logs",
+]);
+
+function pagesForRole(isAdmin) {
+  const all = [
+    { name: "Dashboard", icon: "⌂" },
+    { name: "Live Monitoring", icon: "◉" },
+    { name: "Camera Management", icon: "▣" },
+    { name: "Alerts", icon: "!" },
+    { name: "Detection Logs", icon: "≡" },
+    { name: "Analytics", icon: "▥" },
+    { name: "User Management", icon: "◍" },
+    { name: "Audit Logs", icon: "⎙" },
+    { name: "System Settings", icon: "⚙" },
+  ];
+  return isAdmin ? all : all.filter((p) => !ADMIN_ONLY_PAGES.has(p.name));
+}
+
+
+// ============================================================
+// LOGIN
+// ============================================================
+
+function Login({ onSignedIn }) {
+  const [userId, setUserId] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [backendUp, setBackendUp] = useState(null);
+
+  // /api/health is the one route that stays open, precisely so this screen
+  // can tell "wrong password" apart from "the backend is not running".
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const r = await fetch(`${API}/api/health`);
+        if (!cancelled) setBackendUp(r.ok);
+      } catch {
+        if (!cancelled) setBackendUp(false);
+      }
+    };
+    check();
+    const t = setInterval(check, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId, password }),
+      });
+
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        body = null;
+      }
+
+      if (!response.ok) {
+        // The backend decides what a failure means and says so in one
+        // sentence. React does not second-guess it, and in particular does
+        // not try to tell "no such user" from "wrong password" - the
+        // backend deliberately does not distinguish them either.
+        setError({
+          title:
+            response.status === 403
+              ? "ACCOUNT DISABLED"
+              : response.status === 429
+              ? "TOO MANY ATTEMPTS"
+              : "INVALID CREDENTIALS",
+          message:
+            body?.detail || "Sign-in failed. Please try again.",
+        });
+        setPassword("");
+        return;
+      }
+
+      writeToken(body.token);
+      onSignedIn(body);
+    } catch {
+      setError({
+        title: "BACKEND UNREACHABLE",
+        message: `No response from ${API}. The API process is not running.`,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="login-shell">
+      <div className="login-panel">
+        <div className="login-brand">
+          <img src="/logo-mark.png" alt="" />
+          <div>
+            <div className="brand-title">
+              VISION<span>VIGILANTS</span>
+            </div>
+            <div className="brand-sub">IBVAP SURVEILLANCE</div>
+          </div>
+        </div>
+
+        <div className="login-head">
+          <div className="section-label">SECURE COMMAND ACCESS</div>
+          <p>
+            Sign in with the credentials issued by your Super Administrator.
+          </p>
+        </div>
+
+        {error && (
+          <div className="login-error">
+            <strong>{error.title}</strong>
+            <span>{error.message}</span>
+          </div>
+        )}
+
+        <form onSubmit={submit}>
+          <label className="field">
+            <span>USER ID</span>
+            <input
+              type="text"
+              value={userId}
+              autoFocus
+              autoComplete="username"
+              spellCheck="false"
+              placeholder="ADMIN-001"
+              onChange={(e) => setUserId(e.target.value)}
+            />
+          </label>
+
+          <label className="field">
+            <span>PASSWORD</span>
+            <input
+              type="password"
+              value={password}
+              autoComplete="current-password"
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </label>
+
+          <button
+            className="login-btn"
+            type="submit"
+            disabled={busy || !userId || !password}
+          >
+            {busy ? "VERIFYING…" : "SIGN IN"}
+          </button>
+        </form>
+
+        <div className="login-foot">
+          <span className="login-warn">Authorized personnel only</span>
+          <span
+            className={`login-health ${
+              backendUp === false ? "down" : backendUp ? "up" : ""
+            }`}
+          >
+            {backendUp === null
+              ? "CHECKING BACKEND"
+              : backendUp
+              ? "BACKEND ONLINE"
+              : "BACKEND OFFLINE"}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// ACCESS DENIED
+// ============================================================
+//
+// Reached only if a normal user's interface somehow routes them to an admin
+// page. It is a backstop, not the security boundary - the request behind the
+// page is refused by the backend whether or not this screen ever renders.
+
+function AccessDenied({ required = "SUPER ADMIN", onReturn }) {
+  return (
+    <div className="page">
+      <div className="denied">
+        <div className="denied-mark">✕</div>
+        <h2>ACCESS DENIED</h2>
+        <p>You don&rsquo;t have permission to access this section.</p>
+        <div className="denied-role">
+          <span className="section-label">REQUIRED ROLE</span>
+          <strong>{required}</strong>
+        </div>
+        <button className="login-btn" onClick={onReturn}>
+          RETURN TO DASHBOARD
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// SESSION EXPIRY WARNING
+// ============================================================
+
+function SessionWarning({ secondsLeft, onContinue, onSignOut }) {
+  return (
+    <div className="session-overlay">
+      <div className="session-dialog">
+        <div className="section-label">SESSION EXPIRING</div>
+        <h3>Your session will expire due to inactivity.</h3>
+        <div className="session-count">{Math.max(0, secondsLeft)}s</div>
+        <p>
+          Continuing sends one authenticated request, which resets the idle
+          timer on the server.
+        </p>
+        <div className="session-actions">
+          <button className="login-btn" onClick={onContinue}>
+            CONTINUE SESSION
+          </button>
+          <button className="session-out" onClick={onSignOut}>
+            SIGN OUT NOW
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// AUTH GATE
+// ============================================================
+//
+// Decides whether the dashboard renders at all. Holds the signed-in user,
+// runs the idle countdown, and hands both down to App.
+
+function AuthGate() {
+  const [auth, setAuth] = useState(null);
+  const [booting, setBooting] = useState(true);
+  const [notice, setNotice] = useState(null);
+
+  // Seconds since the last authenticated request, kept here so the whole app
+  // shares one clock.
+  const [idleSeconds, setIdleSeconds] = useState(0);
+
+  const signOutLocal = (reason) => {
+    writeToken(null);
+    setAuth(null);
+    setIdleSeconds(0);
+    if (reason === "SESSION_EXPIRED") {
+      setNotice({
+        title: "SESSION EXPIRED",
+        message: "Please sign in again.",
+      });
+    }
+  };
+
+  // Installed once so apiFetch anywhere in the app can end the session.
+  useEffect(() => {
+    onSessionLost = signOutLocal;
+    return () => {
+      onSessionLost = () => {};
+    };
+  }, []);
+
+  // On load, ask the backend who we are. The answer comes from the database
+  // via the session token - never from anything the browser stored about
+  // itself - so a tampered local copy of the role changes nothing.
+  useEffect(() => {
+    let cancelled = false;
+    const restore = async () => {
+      const token = readToken();
+      if (!token) {
+        if (!cancelled) setBooting(false);
+        return;
+      }
+      try {
+        const response = await fetch(`${API}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (response.ok) {
+          const body = await response.json();
+          if (!cancelled) setAuth(body);
+        } else {
+          writeToken(null);
+        }
+      } catch {
+        writeToken(null);
+      } finally {
+        if (!cancelled) setBooting(false);
+      }
+    };
+    restore();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // The idle clock. Any activity in the app resets it, and so does any
+  // authenticated request, because the server's idle timer is refreshed by
+  // the same traffic.
+  useEffect(() => {
+    if (!auth) return undefined;
+    const reset = () => setIdleSeconds(0);
+    const events = ["mousedown", "keydown", "wheel", "touchstart"];
+    events.forEach((e) => window.addEventListener(e, reset, { passive: true }));
+    const tick = setInterval(() => setIdleSeconds((s) => s + 1), 1000);
+    return () => {
+      events.forEach((e) => window.removeEventListener(e, reset));
+      clearInterval(tick);
+    };
+  }, [auth]);
+
+  const signOut = async () => {
+    try {
+      await apiFetch(`${API}/api/auth/logout`, { method: "POST" });
+    } catch {
+      // The local session ends either way. A failed logout call must not
+      // leave somebody stuck signed in on the screen in front of them.
+    }
+    signOutLocal();
+  };
+
+  if (booting) {
+    return (
+      <div className="login-shell">
+        <div className="login-boot">RESTORING SESSION…</div>
+      </div>
+    );
+  }
+
+  if (!auth) {
+    return (
+      <>
+        {notice && (
+          <div className="login-shell-notice">
+            <strong>{notice.title}</strong> {notice.message}
+          </div>
+        )}
+        <Login
+          onSignedIn={(body) => {
+            setNotice(null);
+            setIdleSeconds(0);
+            setAuth(body);
+          }}
+        />
+      </>
+    );
+  }
+
+  const idleLimit = auth.session_idle_seconds || 1800;
+  const warnAt = auth.warn_before_expiry_seconds || 120;
+  const secondsLeft = Math.ceil(idleLimit - idleSeconds);
+  const warning = secondsLeft <= warnAt;
+
+  return (
+    <>
+      <App auth={auth} onSignOut={signOut} />
+      {warning && (
+        <SessionWarning
+          secondsLeft={secondsLeft}
+          onContinue={async () => {
+            // One real request. Tapping a button that only reset a local
+            // counter would leave the SERVER's idle timer running, and the
+            // session would die anyway a moment later.
+            setIdleSeconds(0);
+            await apiFetch(`${API}/api/auth/me`);
+          }}
+          onSignOut={signOut}
+        />
+      )}
+    </>
+  );
+}
+
+
+function App({ auth, onSignOut }) {
   const [activeTab, setActiveTab] = useState("Dashboard");
+
+  // The role the BACKEND assigned, read from /api/auth/login or
+  // /api/auth/me. Never taken from anything the browser stored about
+  // itself, and never used as the only thing standing between a normal
+  // user and an admin endpoint.
+  const isAdmin = Boolean(auth?.user?.is_admin);
 
   const [cameras, setCameras] = useState([]);
   const [selectedCamera, setSelectedCamera] = useState(null);
@@ -59,7 +579,7 @@ function App() {
 
   const fetchCameras = async () => {
     try {
-      const response = await fetch(
+      const response = await apiFetch(
         `${API}/api/cameras`
       );
 
@@ -76,7 +596,7 @@ function App() {
       const updatedCameras = await Promise.all(
         cameraList.map(async (camera) => {
           try {
-            const statsResponse = await fetch(
+            const statsResponse = await apiFetch(
               `${API}/api/cameras/${camera.id}/stats`
             );
 
@@ -165,7 +685,7 @@ function App() {
 
   const fetchSystemStatus = async () => {
     try {
-      const response = await fetch(
+      const response = await apiFetch(
         `${API}/api/health`
       );
 
@@ -206,7 +726,7 @@ function App() {
     const results = await Promise.all(
       live.map(async (camera) => {
         try {
-          const response = await fetch(
+          const response = await apiFetch(
             `${API}/api/cameras/${camera.id}/tracks`
           );
 
@@ -258,7 +778,7 @@ function App() {
     setLoadingCamera(cameraId);
 
     try {
-      const response = await fetch(
+      const response = await apiFetch(
         `${API}/api/cameras/${cameraId}/start`,
         {
           method: "POST",
@@ -300,7 +820,7 @@ function App() {
     setLoadingCamera(cameraId);
 
     try {
-      const response = await fetch(
+      const response = await apiFetch(
         `${API}/api/cameras/${cameraId}/stop`,
         {
           method: "POST",
@@ -343,7 +863,7 @@ function App() {
 
       await Promise.all(
         activeCameras.map((camera) =>
-          fetch(
+          apiFetch(
             `${API}/api/cameras/${camera.id}/stop`,
             {
               method: "POST",
@@ -369,76 +889,35 @@ function App() {
     (camera) => camera.running
   ).length;
 
-  const totalPersons = cameras.reduce(
-    (total, camera) =>
-      total +
-      Number(
-        camera.stats?.persons || 0
-      ),
-    0
+  // Fleet totals sum ONLY cameras that are running. A stopped camera has no
+  // live state to contribute, and counting its last session produced
+  // "0 cameras active, 3 alerts" - a sentence that cannot be true.
+  //
+  // These are the FLEET view. The per-camera view below is what the selected
+  // camera's tiles read, and the two are deliberately different numbers.
+  const runningCameras = cameras.filter(
+    (camera) => camera.stats?.status === "ONLINE"
   );
 
-  const totalVehicles = cameras.reduce(
-    (total, camera) =>
-      total +
-      Number(
-        camera.stats?.vehicles || 0
-      ),
-    0
-  );
+  const sumLive = (key) =>
+    runningCameras.reduce(
+      (total, camera) => total + Number(camera.stats?.[key] || 0),
+      0
+    );
 
-  const totalAlerts = cameras.reduce(
-    (total, camera) =>
-      total +
-      Number(
-        camera.stats?.alerts || 0
-      ),
-    0
-  );
-
-  const totalDetections = cameras.reduce(
-    (total, camera) =>
-      total +
-      Number(
-        camera.stats?.detections || 0
-      ),
-    0
-  );
+  const totalPersons = sumLive("persons");
+  const totalVehicles = sumLive("vehicles");
+  const totalAlerts = sumLive("alerts");
+  const totalDetections = sumLive("detections");
 
   // ============================================================
   // NAVIGATION
   // ============================================================
 
-  const navigation = [
-    {
-      name: "Dashboard",
-      icon: "⌂",
-    },
-    {
-      name: "Live Monitoring",
-      icon: "◉",
-    },
-    {
-      name: "Camera Management",
-      icon: "▣",
-    },
-    {
-      name: "Alerts",
-      icon: "!",
-    },
-    {
-      name: "Detection Logs",
-      icon: "≡",
-    },
-    {
-      name: "Analytics",
-      icon: "▥",
-    },
-    {
-      name: "System Settings",
-      icon: "⚙",
-    },
-  ];
+  // Built from the role the backend reported. A page a normal user may
+  // not use is not rendered in the sidebar - but the endpoints behind it
+  // refuse that role independently, which is what actually protects it.
+  const navigation = pagesForRole(isAdmin);
 
   // ============================================================
   // PAGE RENDERER
@@ -465,23 +944,6 @@ function App() {
           />
         );
 
-      case "Camera Management":
-        return (
-          <CameraManagement
-            cameras={cameras}
-            selected={selected}
-            selectedCamera={selectedCamera}
-            setSelectedCamera={
-              setSelectedCamera
-            }
-            startCamera={startCamera}
-            stopCamera={stopCamera}
-            loadingCamera={
-              loadingCamera
-            }
-          />
-        );
-
       case "Alerts":
         return (
           <AlertsPage
@@ -503,11 +965,42 @@ function App() {
           />
         );
 
+      case "User Management":
+        return isAdmin ? (
+          <UserManagement auth={auth} />
+        ) : (
+          <AccessDenied onReturn={() => setActiveTab("Dashboard")} />
+        );
+
+      case "Audit Logs":
+        return isAdmin ? (
+          <AuditLogs />
+        ) : (
+          <AccessDenied onReturn={() => setActiveTab("Dashboard")} />
+        );
+
+      case "Camera Management":
+        return isAdmin ? (
+          <CameraManagement
+            cameras={cameras}
+            selected={selected}
+            selectedCamera={selectedCamera}
+            setSelectedCamera={setSelectedCamera}
+            startCamera={startCamera}
+            stopCamera={stopCamera}
+            loadingCamera={loadingCamera}
+          />
+        ) : (
+          <AccessDenied onReturn={() => setActiveTab("Dashboard")} />
+        );
+
       case "System Settings":
-        return (
+        return isAdmin ? (
           <Settings
             cameras={cameras}
           />
+        ) : (
+          <AccessDenied onReturn={() => setActiveTab("Dashboard")} />
         );
 
       default:
@@ -530,6 +1023,7 @@ function App() {
             totalDetections={
               totalDetections
             }
+            runningCount={runningCameras.length}
             setSelectedCamera={
               setSelectedCamera
             }
@@ -548,6 +1042,7 @@ function App() {
   // ============================================================
 
   return (
+    <AccessContext.Provider value={{ canControl: isAdmin }}>
     <div className="app-shell">
 
       {/* ======================================================
@@ -619,22 +1114,31 @@ function App() {
                 SYSTEM ONLINE
               </div>
 
+              {/* The access level in the operator's own words, so what a
+                  person can do is stated rather than inferred from which
+                  menu items happen to be present. */}
               <div className="indicator-text">
-                AI Engine Operational
+                {auth.user.role_tagline}
               </div>
 
             </div>
 
           </div>
 
-          <button
-            className="shutdown-button"
-            onClick={
-              stopAllCameras
-            }
-          >
-            STOP ALL CAMERAS
-          </button>
+          {/* Stopping every camera is camera management, and the backend
+              refuses it for a normal user. Showing an operator a button
+              that will only ever answer 403 is worse than not showing it:
+              it reads as a broken system rather than a restricted one. */}
+          {isAdmin && (
+            <button
+              className="shutdown-button"
+              onClick={
+                stopAllCameras
+              }
+            >
+              STOP ALL CAMERAS
+            </button>
+          )}
 
         </div>
 
@@ -691,6 +1195,22 @@ function App() {
 
             </div>
 
+            {/* Who is signed in, and the way out. The role shown here is
+                the one the backend reported; it is a label, not a
+                permission, and changing it in devtools would change
+                nothing about what the API will answer. */}
+            <div className="topbar-user">
+              <div className="topbar-who">
+                <div className="topbar-name">{auth.user.username}</div>
+                <div className={`topbar-role ${auth.user.role.toLowerCase()}`}>
+                  {auth.user.role_label}
+                </div>
+              </div>
+              <button className="logout-btn" onClick={onSignOut}>
+                LOGOUT
+              </button>
+            </div>
+
           </div>
 
         </header>
@@ -722,6 +1242,7 @@ function App() {
       </main>
 
     </div>
+    </AccessContext.Provider>
   );
 }
 
@@ -738,11 +1259,26 @@ function Dashboard({
   totalVehicles,
   totalAlerts,
   totalDetections,
+  runningCount,
   setSelectedCamera,
   startCamera,
   stopCamera,
   loadingCamera,
 }) {
+  // The selected camera's OWN live state. Every value is read from that
+  // camera's stats object, so CAM-02's numbers can never appear under
+  // CAM-01. A stopped camera reports zeros because the backend resets its
+  // live counters on stop.
+  const stats = selected?.stats;
+  const live = {
+    id: selected?.id || "NO CAMERA",
+    running: stats?.status === "ONLINE",
+    persons: Number(stats?.persons || 0),
+    vehicles: Number(stats?.vehicles || 0),
+    alerts: Number(stats?.alerts || 0),
+    detections: Number(stats?.detections || 0),
+  };
+
   return (
     <div className="page">
 
@@ -780,22 +1316,39 @@ function Dashboard({
           detail={`${cameras.length} configured`}
         />
 
+        {/* These three read the SELECTED camera, not the fleet. Each
+            camera's live state is its own; the fleet total is kept on the
+            sub-line so both are visible and neither is mistaken for the
+            other. A camera that is not running reads zero. */}
+
         <DashboardStat
-          label="PERSONS"
-          value={totalPersons}
-          detail="Live detection"
+          label={`PERSONS — ${live.id}`}
+          value={live.persons}
+          detail={
+            live.running
+              ? `${totalPersons} across ${runningCount} running`
+              : "camera not running"
+          }
         />
 
         <DashboardStat
-          label="VEHICLES"
-          value={totalVehicles}
-          detail="Live detection"
+          label={`VEHICLES — ${live.id}`}
+          value={live.vehicles}
+          detail={
+            live.running
+              ? `${totalVehicles} across ${runningCount} running`
+              : "camera not running"
+          }
         />
 
         <DashboardStat
-          label="ALERTS"
-          value={totalAlerts}
-          detail={`${totalDetections} detections`}
+          label={`ALERTS — ${live.id}`}
+          value={live.alerts}
+          detail={
+            live.running
+              ? `${live.detections} detections this run`
+              : "camera not running"
+          }
         />
 
       </div>
@@ -1240,7 +1793,99 @@ function LiveMonitoring({
         ))}
       </div>
 
+      <LiveEventFeed cameras={cameras} />
+
     </div>
+  );
+}
+
+
+// ============================================================
+// LIVE EVENT FEED
+// ============================================================
+//
+// The same events the Detection Logs page shows, from the same endpoint,
+// while the cameras are still running.
+//
+// This is the point of having one event source. The pipeline raises an
+// incident; that incident sets the threat level drawn on the person's
+// bounding box, becomes the alert the operator is shown, and is written to
+// the database. This panel and Detection Logs are two readings of that one
+// record, not two systems that happen to agree. Nothing here is generated
+// in React - remove the backend and this panel is empty, as it should be.
+
+function LiveEventFeed({ cameras }) {
+  const [events, setEvents] = useState([]);
+
+  const sessions = useMemo(
+    () =>
+      cameras
+        .map(
+          (item) =>
+            item.stats?.session_id ?? item.stats?.final?.session_id ?? null
+        )
+        .filter((value) => value != null)
+        .join(","),
+    [cameras]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const load = async () => {
+      try {
+        const response = await apiFetch(
+          `${API}/api/events?session_ids=${encodeURIComponent(
+            sessions
+          )}&limit=12`
+        );
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!cancelled) setEvents(Array.isArray(data) ? data : []);
+      } catch {
+        // The wall already reports backend state; a silent feed here is
+        // better than a second error banner saying the same thing.
+      }
+    };
+
+    load();
+    const timer = setInterval(load, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [sessions]);
+
+  if (events.length === 0) return null;
+
+  return (
+    <section className="panel live-feed">
+      <div className="panel-header">
+        <h3>Live Event Feed</h3>
+        <span className="panel-count">
+          SAME RECORDS AS DETECTION LOGS
+        </span>
+      </div>
+      <div className="log-timeline">
+        {events.map((event) => (
+          <div className="log-event" key={event.incident_id}>
+            <div className="log-event-head log-event-static">
+              <span className="log-event-time">{event.time}</span>
+              <span
+                className={`log-level ${threatClass(event.threat_level)}`}
+              >
+                {event.threat_level || "UNKNOWN"}
+              </span>
+              <span className="log-event-cam">{event.camera_id}</span>
+              <span className="log-event-actor">
+                {event.object_label || "UNTRACKED"}
+              </span>
+              <span className="log-event-what">{event.headline}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -1280,6 +1925,12 @@ function WallTile({
   onStop,
   loading,
 }) {
+  // Camera control is a Super Admin action. The button is hidden rather
+  // than disabled for a normal user: the backend will refuse the request
+  // either way, and an interface full of dead controls reads as broken
+  // rather than restricted.
+  const { canControl } = useAccess();
+
   const stats = camera.stats || EMPTY_STATS;
   const status = stats.status || "OFFLINE";
   const stream = stats.stream || "IDLE";
@@ -1307,7 +1958,7 @@ function WallTile({
       <div className="tile-video">
         {showVideo ? (
           <img
-            src={`${API}/api/cameras/${camera.id}/stream`}
+            src={streamUrl(camera.id)}
             alt={`${camera.id} live feed`}
           />
         ) : (
@@ -1425,6 +2076,12 @@ function ExpandedCamera({
   stopCamera,
   loadingCamera,
 }) {
+  // Camera control is a Super Admin action. The button is hidden rather
+  // than disabled for a normal user: the backend will refuse the request
+  // either way, and an interface full of dead controls reads as broken
+  // rather than restricted.
+  const { canControl } = useAccess();
+
   const stats = camera.stats || EMPTY_STATS;
   const online = stats.status === "ONLINE";
 
@@ -1461,7 +2118,11 @@ function ExpandedCamera({
           <CameraFeed camera={camera} />
 
           <div className="camera-control-row">
-            {online ? (
+            {!canControl ? (
+              <span className="control-locked">
+                Camera control requires Super Admin
+              </span>
+            ) : online ? (
               <button
                 className="stop-btn"
                 onClick={() => stopCamera(camera.id)}
@@ -1619,6 +2280,12 @@ function CameraCard({
   onStop,
   loading,
 }) {
+  // Camera control is a Super Admin action. The button is hidden rather
+  // than disabled for a normal user: the backend will refuse the request
+  // either way, and an interface full of dead controls reads as broken
+  // rather than restricted.
+  const { canControl } = useAccess();
+
   return (
     <div
       className={`camera-card ${
@@ -1669,9 +2336,62 @@ function CameraCard({
         {camera.location}
       </div>
 
-      <div className="camera-actions">
+              {/* The CONCLUDED result of this camera's last completed run, not
+            the current frame. `final` is written by the backend at the
+            moment the run ends and survives the camera going OFFLINE;
+            `result_status` says whether the numbers can be trusted yet,
+            which the live status cannot - a camera reads OFFLINE both
+            before its first run and after a finished one. */}
+        {(() => {
+          const result = camera.stats?.final;
+          const state = camera.stats?.result_status || "NEVER_RUN";
+          const done = state === "COMPLETED" || state === "STOPPED";
 
-        {camera.running ? (
+          return (
+            <>
+              <div className={`card-result-state state-${state.toLowerCase()}`}>
+                {state === "PROCESSING" && (
+                  <span className="pulse-dot" />
+                )}
+                {state === "NEVER_RUN" ? "NOT YET RUN" : state}
+              </div>
+
+              <div className="card-live">
+                <span>
+                  PERSONS{" "}
+                  <strong>
+                    {done && result ? result.persons : "--"}
+                  </strong>
+                </span>
+                <span>
+                  VEHICLES{" "}
+                  <strong>
+                    {done && result ? result.vehicles : "--"}
+                  </strong>
+                </span>
+                <span>
+                  ALERTS{" "}
+                  <strong>
+                    {done && result ? result.alerts : "--"}
+                  </strong>
+                </span>
+              </div>
+
+              {done && result && (
+                <div className="card-result-note">
+                  unique over {result.frames_processed} analysed frames
+                  {result.completed ? "" : " (stopped early)"}
+                </div>
+              )}
+            </>
+          );
+        })()}
+
+<div className="camera-actions">
+
+        {!canControl ? (
+          <span className="control-locked">VIEW ONLY</span>
+        ) : camera.running ? (
 
           <button
             className="stop-btn"
@@ -1869,7 +2589,7 @@ function CameraFeed({ camera }) {
     <div className="camera-feed">
 
       <img
-        src={`${API}/api/cameras/${camera.id}/stream`}
+        src={streamUrl(camera.id)}
         alt={`${camera.id} live surveillance feed`}
       />
 
@@ -2071,26 +2791,22 @@ function StatsGrid({ stats }) {
 
 function AlertsPage({ cameras }) {
 
-  const totalAlerts =
-    cameras.reduce(
-      (total, camera) =>
-        total +
-        Number(
-          camera.stats?.alerts || 0
-        ),
-      0
-    );
+  // Live counts, from RUNNING cameras only, consistent with the dashboard.
+  // A stopped camera has no live alerts; its past ones live in the database
+  // with their camera_id and belong to the history view, not this total.
+  const running = cameras.filter(
+    (camera) => camera.stats?.status === "ONLINE"
+  );
 
-  const totalIncidents =
-    cameras.reduce(
-      (total, camera) =>
-        total +
-        Number(
-          camera.stats?.incidents ||
-            0
-        ),
-      0
-    );
+  const totalAlerts = running.reduce(
+    (total, camera) => total + Number(camera.stats?.alerts || 0),
+    0
+  );
+
+  const totalIncidents = running.reduce(
+    (total, camera) => total + Number(camera.stats?.incidents || 0),
+    0
+  );
 
   return (
     <div className="page">
@@ -2216,128 +2932,525 @@ function AlertsPage({ cameras }) {
 // ============================================================
 // DETECTION LOGS
 // ============================================================
+//
+// The recorded event log for one camera, or for all of them.
+//
+// This page shows what the pipeline CONCLUDED, not what it is seeing now.
+// That is the whole difference between it and Live Monitoring, and it is
+// why every number and every word below comes from the backend:
+//
+//   summary counts   <- camera.stats.final, written by the API when the
+//                       run ended (distinct confirmed identities, deduped
+//                       incidents), never a count of the last frame
+//   events           <- /api/events, one row per incident, already
+//                       deduplicated by IncidentManager
+//   threat level     <- the ThreatEngine's stored verdict
+//   headline / text  <- composed in Python, from the incident type and the
+//                       behaviour the classifier recorded
+//
+// Nothing on this page is derived in React. If the backend has not
+// concluded something, the interface says so rather than filling the gap.
 
-function DetectionLogs({
-  cameras,
-}) {
+const THREAT_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
+
+function threatClass(level) {
+  const upper = String(level || "").toUpperCase();
+  return THREAT_ORDER.includes(upper)
+    ? `threat-${upper.toLowerCase()}`
+    : "threat-unknown";
+}
+
+// How the run ended, in the operator's words. A camera reads OFFLINE both
+// before its first run and after a finished one, so the live status cannot
+// answer this; result_status can.
+const SESSION_WORDS = {
+  NEVER_RUN: "NOT YET RUN",
+  PROCESSING: "PROCESSING",
+  COMPLETED: "COMPLETED",
+  STOPPED: "STOPPED / INCOMPLETE",
+  ERROR: "ERROR",
+};
+
+function DetectionLogs({ cameras }) {
+  // "ALL" or a camera id. Nothing else is a valid selection, and the whole
+  // page reads from this one value.
+  const [selection, setSelection] = useState("ALL");
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(true);
+  // WHY the list is empty, when it is empty. Three different facts that
+  // must never wear each other's words:
+  //   null            - the list is the truth; zero events means zero events
+  //   {kind:"network"}- the backend could not be reached at all
+  //   {kind:"http"}   - the backend answered, and refused
+  // Collapsing these is what produced "Could not reach the backend event
+  // log" while the backend was up and answering every other request.
+  const [problem, setProblem] = useState(null);
+  const [openEvent, setOpenEvent] = useState(null);
+  const [newestFirst, setNewestFirst] = useState(true);
+
+  const camera = useMemo(
+    () => cameras.find((item) => item.id === selection) || null,
+    [cameras, selection]
+  );
+
+  // Which RUN the events come from: the session this camera is on, or was
+  // last on. Scoping to it is what keeps the two halves of this page
+  // describing the same thing - re-running a camera replaces both the
+  // summary and the event list, instead of showing new totals over old
+  // events.
+  //
+  // null when the camera has not run in this backend process. That is NOT
+  // the same as "no filter": leaving the scope off returns everything the
+  // camera ever recorded, which would put yesterday's events under a "NOT
+  // YET RUN" heading. An empty scope returns nothing, which is the true
+  // answer.
+  //
+  // The backend decides this for a single camera - /api/cameras/{id}/events
+  // reads its own runtime's session - so the only place this value is
+  // needed here is the consolidated view and the empty-state wording.
+  const sessionId =
+    camera?.stats?.session_id ?? camera?.stats?.final?.session_id ?? null;
+
+  // Has this camera concluded a run at all? Used only to word the empty
+  // state, never to decide what to show.
+  const everRan =
+    (camera?.stats?.result_status || "NEVER_RUN") !== "NEVER_RUN";
+
+  // The same rule across the fleet, for ALL CAMERAS. Joined into a string
+  // so the effect re-runs when the SET changes, not on every render as a
+  // freshly built array would cause.
+  const allSessions = useMemo(
+    () =>
+      cameras
+        .map(
+          (item) =>
+            item.stats?.session_id ?? item.stats?.final?.session_id ?? null
+        )
+        .filter((value) => value != null)
+        .join(","),
+    [cameras]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const load = async () => {
+      // One camera asks the camera's own endpoint, which scopes to that
+      // camera's current run server-side. The consolidated view asks the
+      // fleet endpoint with the set of current runs. Either way the filter
+      // is applied in SQL: the interface never receives another camera's
+      // events and so cannot display them by mistake.
+      const url =
+        selection === "ALL"
+          ? `${API}/api/events?session_ids=${encodeURIComponent(
+              allSessions
+            )}&limit=300`
+          : `${API}/api/cameras/${encodeURIComponent(
+              selection
+            )}/events?limit=300`;
+
+      let response;
+      try {
+        response = await apiFetch(url);
+      } catch {
+        // The request never completed. The backend is down, the port is
+        // wrong, or CORS refused it before a status existed.
+        if (cancelled) return;
+        setEvents([]);
+        setProblem({ kind: "network" });
+        setLoading(false);
+        return;
+      }
+
+      if (!response.ok) {
+        // The backend IS reachable and answered. Say what it answered,
+        // because 404 here means one specific, fixable thing: the running
+        // process predates this endpoint and has to be restarted.
+        if (cancelled) return;
+        setEvents([]);
+        setProblem({ kind: "http", status: response.status });
+        setLoading(false);
+        return;
+      }
+
+      try {
+        const data = await response.json();
+        if (cancelled) return;
+        // The fleet endpoint returns a bare list; the camera endpoint
+        // returns {camera_id, events}. Accept both rather than assuming.
+        const list = Array.isArray(data) ? data : data?.events;
+        setEvents(Array.isArray(list) ? list : []);
+        setProblem(null);
+      } catch {
+        if (cancelled) return;
+        setEvents([]);
+        setProblem({ kind: "http", status: response.status });
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    setLoading(true);
+    setOpenEvent(null);
+    load();
+
+    // Refreshed so a run finishing while this page is open shows up.
+    const timer = setInterval(load, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [selection, sessionId, allSessions]);
+
+  const ordered = useMemo(() => {
+    // Sorted, not recomputed. The backend already returns newest first;
+    // this only honours the operator's choice of direction.
+    const copy = [...events];
+    copy.sort((a, b) =>
+      newestFirst ? (b.ts ?? 0) - (a.ts ?? 0) : (a.ts ?? 0) - (b.ts ?? 0)
+    );
+    return copy;
+  }, [events, newestFirst]);
+
+  const result = camera?.stats?.final || null;
+  const state = camera?.stats?.result_status || "NEVER_RUN";
+  const concluded = state === "COMPLETED" || state === "STOPPED";
+
   return (
     <div className="page">
 
       <div className="page-intro">
-
         <div>
-
-          <div className="section-label">
-            AI ACTIVITY
-          </div>
-
-          <h2>
-            Detection Logs
-          </h2>
-
+          <div className="section-label">RECORDED ACTIVITY</div>
+          <h2>Detection Logs</h2>
           <p>
-            Current detection statistics
-            from all camera processing
-            nodes.
+            Concluded detections and recorded alert events from
+            completed camera processing sessions.
           </p>
-
         </div>
-
       </div>
 
-      <section className="panel">
+      {/* -------------------------------------------------- */}
+      {/* CAMERA SELECTOR                                     */}
+      {/* -------------------------------------------------- */}
 
-        <div className="table-container">
+      <section className="panel log-selector-panel">
+        <div className="log-selector">
+          <div className="section-label">SELECT CAMERA</div>
+          <div className="log-selector-row">
+            <button
+              className={`log-cam-btn ${
+                selection === "ALL" ? "active" : ""
+              }`}
+              onClick={() => setSelection("ALL")}
+            >
+              ALL CAMERAS
+            </button>
 
-          <table>
-
-            <thead>
-
-              <tr>
-                <th>CAMERA</th>
-                <th>PERSONS</th>
-                <th>VEHICLES</th>
-                <th>TRACKS</th>
-                <th>DETECTIONS</th>
-                <th>FPS</th>
-                <th>INFERENCE</th>
-              </tr>
-
-            </thead>
-
-            <tbody>
-
-              {cameras.map(
-                (camera) => (
-
-                  <tr
-                    key={camera.id}
-                  >
-
-                    <td>
-
-                      <strong>
-                        {camera.id}
-                      </strong>
-
-                      <small>
-                        {camera.name}
-                      </small>
-
-                    </td>
-
-                    <td>
-                      {camera.stats?.persons ||
-                        0}
-                    </td>
-
-                    <td>
-                      {camera.stats?.vehicles ||
-                        0}
-                    </td>
-
-                    <td>
-                      {camera.stats?.tracks ||
-                        0}
-                    </td>
-
-                    <td>
-                      {camera.stats?.detections ||
-                        0}
-                    </td>
-
-                    <td>
-                      {Number(
-                        camera.stats?.fps ||
-                          0
-                      ).toFixed(1)}
-                    </td>
-
-                    <td>
-
-                      {Number(
-                        camera.stats
-                          ?.inference_ms ||
-                          0
-                      ).toFixed(1)}
-
-                      ms
-
-                    </td>
-
-                  </tr>
-
-                )
-              )}
-
-            </tbody>
-
-          </table>
-
+            {cameras.map((item) => (
+              <button
+                key={item.id}
+                className={`log-cam-btn ${
+                  selection === item.id ? "active" : ""
+                }`}
+                onClick={() => setSelection(item.id)}
+              >
+                {item.id}
+                <span
+                  className={`log-cam-dot state-${String(
+                    item.stats?.result_status || "NEVER_RUN"
+                  ).toLowerCase()}`}
+                />
+              </button>
+            ))}
+          </div>
         </div>
-
       </section>
 
+      {/* -------------------------------------------------- */}
+      {/* CAMERA SUMMARY                                       */}
+      {/* -------------------------------------------------- */}
+
+      {selection !== "ALL" && camera && (
+        <section className="panel log-summary-panel">
+          <div className="log-summary-head">
+            <div>
+              <div className="log-summary-id">{camera.id}</div>
+              <div className="log-summary-name">
+                {camera.name}
+                {camera.location ? ` — ${camera.location}` : ""}
+              </div>
+            </div>
+            <div
+              className={`log-session-state state-${state.toLowerCase()}`}
+            >
+              <div className="section-label">SESSION</div>
+              {SESSION_WORDS[state] || state}
+            </div>
+          </div>
+
+          <div className="log-summary-grid">
+            <div className="log-metric">
+              <div className="log-metric-label">PERSONS DETECTED</div>
+              <div className="log-metric-value">
+                {concluded && result ? result.persons : "--"}
+              </div>
+            </div>
+            <div className="log-metric">
+              <div className="log-metric-label">VEHICLES DETECTED</div>
+              <div className="log-metric-value">
+                {concluded && result ? result.vehicles : "--"}
+              </div>
+            </div>
+            <div className="log-metric">
+              <div className="log-metric-label">TOTAL ALERTS</div>
+              <div className="log-metric-value">
+                {concluded && result ? result.alerts : "--"}
+              </div>
+            </div>
+          </div>
+
+          {concluded && result ? (
+            <div className="log-summary-note">
+              unique identities over {result.frames_processed} analysed
+              frames
+              {result.completed ? "" : " — session stopped before the source ended"}
+            </div>
+          ) : (
+            <div className="log-summary-note">
+              {state === "PROCESSING"
+                ? "run in progress — final figures are published when it ends"
+                : "this camera has not completed a processing session yet"}
+            </div>
+          )}
+
+          {/* TOTAL ALERTS and the timeline below are produced one for one:
+              every incident raises exactly one alert and appears as exactly
+              one row. If they ever disagree, something is broken and the
+              operator is told, rather than being shown "4" above "0" and
+              left to work it out. */}
+          {concluded &&
+            result &&
+            problem == null &&
+            !loading &&
+            result.alerts !== events.length && (
+              <div className="log-count-mismatch">
+                This session concluded with {result.alerts} alert
+                {result.alerts === 1 ? "" : "s"} but {events.length} event
+                record{events.length === 1 ? "" : "s"} can be read back.
+                The two are written together, so this gap means records
+                were lost between the pipeline and the database.
+              </div>
+            )}
+        </section>
+      )}
+
+      {/* -------------------------------------------------- */}
+      {/* EVENT TIMELINE                                       */}
+      {/* -------------------------------------------------- */}
+
+      <section className="panel">
+        <div className="panel-header">
+          <h3>Alert &amp; Event Timeline</h3>
+          <div className="log-timeline-tools">
+            <span className="panel-count">
+              {loading
+                ? "LOADING"
+                : `${ordered.length} EVENT${
+                    ordered.length === 1 ? "" : "S"
+                  }`}
+            </span>
+            <button
+              className="log-sort-btn"
+              onClick={() => setNewestFirst((value) => !value)}
+            >
+              {newestFirst ? "NEWEST FIRST" : "OLDEST FIRST"}
+            </button>
+          </div>
+        </div>
+
+        {problem?.kind === "network" ? (
+          <div className="log-empty log-empty-error">
+            <strong>BACKEND UNREACHABLE</strong>
+            <span>
+              No response from {API}. The API process is not running, or
+              is not listening on that port.
+            </span>
+          </div>
+        ) : problem?.kind === "http" ? (
+          <div className="log-empty log-empty-error">
+            <strong>EVENT LOG REFUSED ({problem.status})</strong>
+            <span>
+              {problem.status === 404
+                ? "The backend is running but has no event endpoint. It is serving an older build of api/server.py — uvicorn does not reload on its own, so restart it."
+                : `The backend answered ${problem.status} for the event log. Check its console output.`}
+            </span>
+          </div>
+        ) : loading ? (
+          <div className="log-empty">
+            <span>Loading recorded events…</span>
+          </div>
+        ) : ordered.length === 0 ? (
+          <div className="log-empty">
+            <strong>NO EVENTS RECORDED</strong>
+            <span>
+              {selection === "ALL"
+                ? "No camera has recorded an event in its current session."
+                : !everRan
+                ? `${selection} has not been run yet, so it has no recorded events.`
+                : `${selection} recorded no events in this session.`}
+            </span>
+          </div>
+        ) : (
+          <div className="log-timeline">
+            {ordered.map((event) => (
+              <LogEventRow
+                key={event.incident_id}
+                event={event}
+                showCamera={selection === "ALL"}
+                expanded={openEvent === event.incident_id}
+                onToggle={() =>
+                  setOpenEvent(
+                    openEvent === event.incident_id
+                      ? null
+                      : event.incident_id
+                  )
+                }
+              />
+            ))}
+          </div>
+        )}
+      </section>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// ONE RECORDED EVENT
+// ============================================================
+//
+// Every field is printed as the backend sent it. A field the backend did
+// not conclude - a behaviour it never classified, an incident that raised
+// no alert - reads as its own state word rather than a plausible value.
+
+function LogEventRow({ event, showCamera, expanded, onToggle }) {
+  return (
+    <div className={`log-event ${expanded ? "open" : ""}`}>
+
+      <button className="log-event-head" onClick={onToggle}>
+
+        <span className="log-event-time">
+          {event.time || "--:--:--"}
+        </span>
+
+        <span
+          className={`log-level ${threatClass(event.threat_level)}`}
+        >
+          {event.threat_level || "UNKNOWN"}
+        </span>
+
+        {showCamera && (
+          <span className="log-event-cam">{event.camera_id}</span>
+        )}
+
+        <span className="log-event-actor">
+          {event.object_label ||
+            (event.track_id != null
+              ? `Person #${String(event.track_id).padStart(2, "0")}`
+              : "UNTRACKED")}
+        </span>
+
+        <span className="log-event-what">{event.headline}</span>
+
+        <span className="log-event-chevron">
+          {expanded ? "−" : "+"}
+        </span>
+
+      </button>
+
+      {expanded && (
+        <div className="log-event-detail">
+          <dl>
+            <div>
+              <dt>CAMERA</dt>
+              <dd>{event.camera_id}</dd>
+            </div>
+            <div>
+              <dt>TRACK</dt>
+              <dd>
+                {event.track_id != null
+                  ? `#${String(event.track_id).padStart(2, "0")}`
+                  : "NOT TRACKED"}
+              </dd>
+            </div>
+            <div>
+              <dt>OBJECT</dt>
+              <dd>{event.object_type || "UNKNOWN"}</dd>
+            </div>
+            <div>
+              <dt>BEHAVIOUR</dt>
+              <dd>{event.behaviour || "NOT CLASSIFIED"}</dd>
+            </div>
+            <div>
+              <dt>THREAT LEVEL</dt>
+              <dd className={threatClass(event.threat_level)}>
+                {event.threat_level || "UNKNOWN"}
+                {event.threat_score != null
+                  ? ` (${event.threat_score})`
+                  : ""}
+              </dd>
+            </div>
+            <div>
+              <dt>INCIDENT TYPE</dt>
+              <dd>{event.incident_type}</dd>
+            </div>
+            <div>
+              <dt>ZONE / LINE</dt>
+              <dd>{event.zone_name || "NONE"}</dd>
+            </div>
+            <div>
+              <dt>BOUNDARY</dt>
+              <dd>{event.boundary_state || "NOT ASSESSED"}</dd>
+            </div>
+            <div>
+              <dt>TIME</dt>
+              <dd>{event.ts_text || "UNKNOWN"}</dd>
+            </div>
+            <div>
+              <dt>STATUS</dt>
+              <dd>{event.status}</dd>
+            </div>
+          </dl>
+
+          {/* The sentence the operator was shown when this fired, not a
+              second version of it written here. */}
+          {event.message && (
+            <div className="log-event-message">{event.message}</div>
+          )}
+
+          {/* Why the ThreatEngine scored it as it did, in its own words. */}
+          {event.reasons?.length > 0 && (
+            <div className="log-event-reasons">
+              <div className="section-label">SCORING FACTORS</div>
+              <ul>
+                {event.reasons.map((reason, index) => (
+                  <li key={index}>{reason}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {event.escalation_count > 0 && (
+            <div className="log-event-repeat">
+              this event recurred {event.escalation_count} time
+              {event.escalation_count === 1 ? "" : "s"} and was folded into
+              one record
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -2818,8 +3931,507 @@ function formatSource(source) {
 }
 
 
+
+
+// ============================================================
+// USER MANAGEMENT  (Super Admin only)
+// ============================================================
+//
+// Every row here comes from GET /api/admin/users, which a normal user's
+// token cannot call. Rendering this page without the role would therefore
+// show an empty table and an error, not somebody else's user list - the
+// page is not where the protection lives.
+
+function UserManagement({ auth }) {
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [problem, setProblem] = useState(null);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(null);
+
+  const load = async () => {
+    try {
+      const response = await apiFetch(`${API}/api/admin/users`);
+      if (!response.ok) {
+        setProblem(
+          response.status === 403
+            ? "Super Admin authorization required."
+            : `The backend answered ${response.status}.`
+        );
+        setUsers([]);
+        return;
+      }
+      setUsers(await response.json());
+      setProblem(null);
+    } catch {
+      setProblem(`No response from ${API}.`);
+      setUsers([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const act = async (url, options) => {
+    const response = await apiFetch(url, options);
+    if (!response.ok) {
+      let detail = `Request failed (${response.status}).`;
+      try {
+        detail = (await response.json())?.detail || detail;
+      } catch {
+        /* keep the status-only message */
+      }
+      return { ok: false, detail };
+    }
+    await load();
+    return { ok: true };
+  };
+
+  const admins = users.filter((u) => u.role === "SUPER_ADMIN" && u.is_active);
+
+  return (
+    <div className="page">
+      <div className="page-intro">
+        <div>
+          <div className="section-label">ACCESS CONTROL</div>
+          <h2>User Management</h2>
+          <p>
+            Accounts that may sign in to this system, and what each one is
+            allowed to do.
+          </p>
+        </div>
+      </div>
+
+      {problem && (
+        <div className="api-error">{problem}</div>
+      )}
+
+      <section className="panel">
+        <div className="panel-header">
+          <h3>Accounts</h3>
+          <div className="log-timeline-tools">
+            <span className="panel-count">
+              {loading ? "LOADING" : `${users.length} ACCOUNT${users.length === 1 ? "" : "S"}`}
+            </span>
+            <button className="log-sort-btn" onClick={() => setCreating(true)}>
+              + CREATE USER
+            </button>
+          </div>
+        </div>
+
+        <div className="user-table">
+          <div className="user-row user-head">
+            <span>USER ID</span>
+            <span>NAME</span>
+            <span>ROLE</span>
+            <span>STATUS</span>
+            <span>LAST SIGN-IN</span>
+            <span />
+          </div>
+
+          {users.map((user) => {
+            const isSelf = user.user_id === auth.user.user_id;
+            const lastAdmin =
+              user.role === "SUPER_ADMIN" && user.is_active && admins.length <= 1;
+            return (
+              <div className="user-row" key={user.user_id}>
+                <span className="mono">{user.user_id}</span>
+                <span>
+                  {user.username}
+                  {isSelf && <em className="user-you"> you</em>}
+                </span>
+                <span className={`user-role ${user.role.toLowerCase()}`}>
+                  {user.role === "SUPER_ADMIN" ? "SUPER ADMIN" : "NORMAL USER"}
+                </span>
+                <span
+                  className={`user-status ${user.is_active ? "on" : "off"}`}
+                >
+                  <i />
+                  {user.status}
+                  {user.locked && <em className="user-locked">LOCKED</em>}
+                </span>
+                <span className="mono dim">
+                  {user.last_login_ts
+                    ? new Date(user.last_login_ts * 1000).toLocaleString()
+                    : "never"}
+                </span>
+                <span className="user-actions">
+                  <button onClick={() => setEditing(user)}>EDIT</button>
+                  {user.locked && (
+                    <button
+                      onClick={() =>
+                        act(`${API}/api/admin/users/${user.user_id}/unlock`, {
+                          method: "POST",
+                        })
+                      }
+                    >
+                      UNLOCK
+                    </button>
+                  )}
+                  <button
+                    className={user.is_active ? "danger" : ""}
+                    disabled={lastAdmin}
+                    title={
+                      lastAdmin
+                        ? "The only active Super Admin cannot be disabled."
+                        : ""
+                    }
+                    onClick={async () => {
+                      const result = await act(
+                        `${API}/api/admin/users/${user.user_id}`,
+                        {
+                          method: "PUT",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ is_active: !user.is_active }),
+                        }
+                      );
+                      if (!result.ok) setProblem(result.detail);
+                    }}
+                  >
+                    {user.is_active ? "DISABLE" : "ENABLE"}
+                  </button>
+                </span>
+              </div>
+            );
+          })}
+
+          {!loading && users.length === 0 && !problem && (
+            <div className="log-empty">
+              <strong>NO ACCOUNTS</strong>
+              <span>Create the first operator account.</span>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {(creating || editing) && (
+        <UserDialog
+          user={editing}
+          onClose={() => {
+            setCreating(false);
+            setEditing(null);
+          }}
+          onSubmit={async (payload) => {
+            const result = editing
+              ? await act(`${API}/api/admin/users/${editing.user_id}`, {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(payload),
+                })
+              : await act(`${API}/api/admin/users`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(payload),
+                });
+            if (result.ok) {
+              setCreating(false);
+              setEditing(null);
+            }
+            return result;
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+
+function UserDialog({ user, onClose, onSubmit }) {
+  const editing = Boolean(user);
+  const [userId, setUserId] = useState(user?.user_id || "");
+  const [username, setUsername] = useState(user?.username || "");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [role, setRole] = useState(user?.role || "NORMAL_USER");
+  const [active, setActive] = useState(user ? user.is_active : true);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const mismatch = password !== confirm;
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (busy) return;
+    if (password && mismatch) {
+      setError("The two passwords do not match.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+
+    // On edit, only the fields that were actually changed are sent. An
+    // empty password field means "leave the password alone", never "set the
+    // password to empty".
+    const payload = editing
+      ? {
+          username,
+          role,
+          is_active: active,
+          ...(password ? { password } : {}),
+        }
+      : { user_id: userId, username, password, role, is_active: active };
+
+    const result = await onSubmit(payload);
+    setBusy(false);
+    if (!result.ok) setError(result.detail);
+  };
+
+  return (
+    <div className="session-overlay" onClick={onClose}>
+      <div
+        className="session-dialog user-dialog"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="section-label">
+          {editing ? `EDIT ${user.user_id}` : "CREATE USER"}
+        </div>
+
+        {error && <div className="login-error"><span>{error}</span></div>}
+
+        <form onSubmit={submit}>
+          {!editing && (
+            <label className="field">
+              <span>USER ID</span>
+              <input
+                value={userId}
+                autoFocus
+                spellCheck="false"
+                placeholder="USER-002"
+                onChange={(e) => setUserId(e.target.value.toUpperCase())}
+              />
+            </label>
+          )}
+
+          <label className="field">
+            <span>USERNAME</span>
+            <input
+              value={username}
+              placeholder="Operator-01"
+              onChange={(e) => setUsername(e.target.value)}
+            />
+          </label>
+
+          <label className="field">
+            <span>
+              PASSWORD{editing && <em> — leave blank to keep the current one</em>}
+            </span>
+            <input
+              type="password"
+              value={password}
+              autoComplete="new-password"
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </label>
+
+          <label className="field">
+            <span>CONFIRM PASSWORD</span>
+            <input
+              type="password"
+              value={confirm}
+              autoComplete="new-password"
+              onChange={(e) => setConfirm(e.target.value)}
+            />
+            {password && mismatch && (
+              <em className="field-warn">The passwords do not match.</em>
+            )}
+          </label>
+
+          <div className="field-row">
+            <label className="field">
+              <span>ROLE</span>
+              <select value={role} onChange={(e) => setRole(e.target.value)}>
+                <option value="NORMAL_USER">NORMAL USER</option>
+                <option value="SUPER_ADMIN">SUPER ADMIN</option>
+              </select>
+            </label>
+
+            <label className="field">
+              <span>STATUS</span>
+              <select
+                value={active ? "ACTIVE" : "DISABLED"}
+                onChange={(e) => setActive(e.target.value === "ACTIVE")}
+              >
+                <option value="ACTIVE">ACTIVE</option>
+                <option value="DISABLED">DISABLED</option>
+              </select>
+            </label>
+          </div>
+
+          {role === "SUPER_ADMIN" && (
+            <div className="user-warn">
+              A Super Admin can manage every user, every camera and every
+              setting, and can read the audit log. Create one only when
+              somebody genuinely needs that.
+            </div>
+          )}
+
+          <div className="session-actions">
+            <button className="login-btn" type="submit" disabled={busy}>
+              {busy ? "SAVING…" : editing ? "SAVE CHANGES" : "CREATE USER"}
+            </button>
+            <button className="session-out" type="button" onClick={onClose}>
+              CANCEL
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// AUDIT LOG  (Super Admin only)
+// ============================================================
+
+const AUDIT_TONE = {
+  LOGIN_SUCCESS: "ok",
+  LOGOUT: "ok",
+  USER_ENABLED: "ok",
+  USER_CREATED: "ok",
+  LOGIN_FAILED: "warn",
+  LOGIN_BLOCKED: "bad",
+  ACCESS_DENIED: "bad",
+  USER_DISABLED: "warn",
+  USER_DELETED: "bad",
+  PASSWORD_RESET: "warn",
+  SESSION_EXPIRED: "dim",
+};
+
+function AuditLogs() {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [problem, setProblem] = useState(null);
+  const [only, setOnly] = useState("ALL");
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const response = await apiFetch(
+          `${API}/api/admin/audit-logs?limit=300`
+        );
+        if (!response.ok) {
+          if (!cancelled) {
+            setProblem(
+              response.status === 403
+                ? "Super Admin authorization required."
+                : `The backend answered ${response.status}.`
+            );
+            setRows([]);
+          }
+          return;
+        }
+        const data = await response.json();
+        if (!cancelled) {
+          setRows(Array.isArray(data) ? data : []);
+          setProblem(null);
+        }
+      } catch {
+        if (!cancelled) setProblem(`No response from ${API}.`);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    load();
+    const timer = setInterval(load, 6000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  const shown =
+    only === "ALL"
+      ? rows
+      : rows.filter((r) =>
+          only === "SECURITY"
+            ? r.status !== "SUCCESS"
+            : r.action.startsWith("USER_") || r.action === "PASSWORD_RESET"
+        );
+
+  return (
+    <div className="page">
+      <div className="page-intro">
+        <div>
+          <div className="section-label">SECURITY RECORD</div>
+          <h2>Audit Logs</h2>
+          <p>
+            Every sign-in, every refusal and every privileged action, in the
+            order it happened. A refused request is recorded as carefully as
+            a successful one.
+          </p>
+        </div>
+      </div>
+
+      {problem && <div className="api-error">{problem}</div>}
+
+      <section className="panel">
+        <div className="panel-header">
+          <h3>Recorded actions</h3>
+          <div className="log-timeline-tools">
+            <span className="panel-count">
+              {loading ? "LOADING" : `${shown.length} RECORDS`}
+            </span>
+            {["ALL", "SECURITY", "ACCOUNTS"].map((f) => (
+              <button
+                key={f}
+                className={`log-sort-btn ${only === f ? "active" : ""}`}
+                onClick={() => setOnly(f)}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="audit-table">
+          <div className="audit-row audit-head">
+            <span>TIME</span>
+            <span>USER</span>
+            <span>ACTION</span>
+            <span>RESOURCE</span>
+            <span>RESULT</span>
+          </div>
+
+          {shown.map((row) => (
+            <div className="audit-row" key={row.id}>
+              <span className="mono">{row.time}</span>
+              <span className="mono user">{row.user_id || "—"}</span>
+              <span
+                className={`audit-action ${AUDIT_TONE[row.action] || ""}`}
+              >
+                {row.action}
+              </span>
+              <span className="mono dim">{row.resource || "—"}</span>
+              <span className={`audit-status ${row.status.toLowerCase()}`}>
+                {row.status}
+              </span>
+            </div>
+          ))}
+
+          {!loading && shown.length === 0 && !problem && (
+            <div className="log-empty">
+              <strong>NO RECORDS</strong>
+              <span>Nothing matching this filter has been recorded.</span>
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+
+
 // ============================================================
 // EXPORT
 // ============================================================
+//
+// AuthGate, not App. Nothing in the dashboard renders until the backend has
+// confirmed who is asking.
 
-export default App;
+export default AuthGate;

@@ -88,6 +88,7 @@ class IncidentType:
     LOITERING = "loitering"
     ANOMALY = "behavioural_anomaly"
     WATCHLIST = "watchlist_match"
+    SUSPICIOUS_BEHAVIOUR = "suspicious_behaviour"
 
     LABELS = {
         RESTRICTED_INTRUSION: "Restricted zone intrusion",
@@ -97,6 +98,7 @@ class IncidentType:
         LOITERING: "Loitering",
         ANOMALY: "Behavioural anomaly",
         WATCHLIST: "Watchlist match",
+        SUSPICIOUS_BEHAVIOUR: "Suspicious behaviour",
     }
 
     @classmethod
