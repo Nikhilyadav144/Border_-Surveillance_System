@@ -1,0 +1,67 @@
+# --------------------------------------------------------------------------
+# Person activity analysis
+# --------------------------------------------------------------------------
+# Pose landmarks over time, turned into named behaviours. The chain is
+# deliberately four separate stages, each testable on its own:
+#
+#   PoseEstimator -> PoseHistory -> MovementAnalyzer -> BehaviourClassifier
+#
+# The classifier is RULE-BASED. There is no trained action-recognition model
+# in this project and none is implied. Every threshold below is a documented
+# comparison, which is what makes an alert explainable.
+#
+# Distances are measured in the person's OWN standing height rather than in
+# frame units, so the same thresholds work at any distance and on any camera
+# without per-camera tuning. A speed of 1.0 means the person moved their own
+# height in one second.
+activity:
+  enabled: true
+
+  history:
+    # Seconds of pose kept per person. Behaviour is a recent-past question.
+    window_seconds: 3.0
+    # Hard cap on samples per person, so a long-lived track cannot grow
+    # without bound.
+    max_samples: 90
+
+  movement:
+    # Minimum evidence before any behaviour is reported at all. Below these
+    # the answer is UNKNOWN, not a guess.
+    min_samples: 4
+    min_duration: 0.25
+    # Keypoints that must be visible. A person half out of frame produces
+    # fewer, and their geometry cannot be trusted.
+    min_support: 6
+    # Window the speeds are measured over.
+    window_seconds: 1.0
+    # Below this speed nobody is credited with a direction of travel.
+    stationary_speed: 0.15
+
+  behaviour:
+    # Postural, as a fraction of the person's own upright measurement.
+    # hip_ratio is hip-above-ankle height: 1.0 upright, lower is more folded.
+    crouch_hip_ratio: 0.62
+    sit_hip_ratio: 0.78
+    # Overall body height, for crawling.
+    crawl_height_ratio: 0.45
+    crawl_torso_degrees: 55.0
+
+    # Gait, in body heights per second. These come from human gait: a walk is
+    # roughly 1.4 m/s against a 1.7 m frame, a run comfortably over 3 m/s.
+    walk_speed: 0.45
+    run_speed: 1.9
+
+    # Vertical rates for the short, dramatic events.
+    jump_rise_speed: 1.2
+    fall_speed: 1.6
+    fall_torso_degrees: 50.0
+
+    # Knee bend in degrees. 180 is a straight leg.
+    bent_knee_degrees: 125.0
+
+    # Debounce. A candidate behaviour must hold this long before it is
+    # believed, which is what stops one noisy frame raising an event.
+    # Falls and jumps get the shorter hold because they are over quickly.
+    hold_seconds: 0.30
+    event_hold_seconds: 0.15
+

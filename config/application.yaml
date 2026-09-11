@@ -1,0 +1,480 @@
+# ==========================================================================
+# Border Guard AI - Application Configuration
+# --------------------------------------------------------------------------
+# Every operational parameter lives here. Nothing important is hard-coded in
+# the Python sources. Edit this file, or use the Settings screen in the GUI
+# (which writes back to this file).
+# ==========================================================================
+
+application:
+  # Product name and team. Both interfaces read these rather than
+  # hard-coding a string, so renaming happens here and nowhere else.
+  name: "IBVAP"
+  subtitle: "Intelligent Border Video Analytics Platform"
+  # Shown alongside the logo in both the desktop app and the dashboard.
+  team: "Vision Vigilants"
+  # Prototype build identifier, shown in the About dialog.
+  version: "1.0.0"
+
+paths:
+  # All paths are relative to the project root unless absolute.
+  data_dir: "data"
+  input_dir: "data/input"
+  output_dir: "data/output"
+  evidence_dir: "data/evidence"
+  database_dir: "data/database"
+  models_dir: "models"
+  logs_dir: "logs"
+  database_file: "data/database/borderguard.db"
+
+# --------------------------------------------------------------------------
+# Object detection
+# --------------------------------------------------------------------------
+detection:
+  # Path to YOLO weights, relative to models_dir or absolute.
+  # yolov8n.pt is the stock COCO model: it knows person, car, motorcycle,
+  # bus, truck and 75 other everyday classes. It is the sensible default for
+  # ground-level and drone footage.
+  #
+  # border_yolo.pt is a custom 7-class model trained on aerial imagery
+  # (DOTA + xView + VisDrone). Only use it for top-down aerial footage.
+  # Its measured recall for 'person' is 0.28, so it misses most people in
+  # ground-level video.
+  model_path: "yolov8n.pt"
+
+  confidence: 0.35
+  iou: 0.50
+  image_size: 640
+
+  # "auto" picks CUDA, then Apple Silicon MPS, then CPU.
+  # Force a specific device with "cpu", "mps", "cuda:0".
+  device: "auto"
+
+  # Only these class names are processed. Names are matched against the
+  # class list of the model that is actually loaded. A name that the loaded
+  # model does not support is reported at startup and ignored - it is never
+  # silently invented.
+  # Leave the list empty to process every class the model supports.
+  classes:
+    - person
+    - car
+    - motorcycle
+    - bus
+    - truck
+    - bicycle
+
+  # Which of the above count as vehicles for ANPR and zone rules.
+  vehicle_classes:
+    - car
+    - motorcycle
+    - bus
+    - truck
+    - bicycle
+
+  person_classes:
+    - person
+
+  # Process every Nth frame. 1 = every frame. Raise it if playback stutters.
+  frame_stride: 2
+
+  # Half precision. Ignored on CPU and MPS.
+  half: false
+
+# --------------------------------------------------------------------------
+# Multi-object tracking
+# --------------------------------------------------------------------------
+tracking:
+  # "bytetrack" or "botsort". Both ship with Ultralytics.
+  tracker: "bytetrack"
+  # A track is dropped this many processed frames after its last detection.
+  # This is the RE-IDENTIFICATION window: how long the tracker keeps the
+  # identity around so the same person can reclaim it after an occlusion.
+  max_age_frames: 30
+  # A track must be seen this many times before it can raise an incident.
+  min_hits: 3
+  # How many processed frames a track may go unmatched and still be shown to
+  # the operator as a live object.
+  #
+  # This is much shorter than max_age_frames on purpose, and they answer
+  # different questions. An unmatched track keeps its LAST box, speed,
+  # posture and behaviour, because nothing updates them. Publishing it for
+  # the full re-identification window means publishing a frozen assertion
+  # about someone who may have walked away: on CAM-01, PERSON #01 left the
+  # frame at f149 and went on being reported at 3.72 body heights per second
+  # and labelled RUNNING for another 60 frames.
+  #
+  # Not zero, because a detector that misses a single frame should not make
+  # a person blink out of the table and back in.
+  coast_frames: 5
+  # Trajectory points retained per track.
+  max_trajectory_points: 240
+  # Pixels-per-metre for the speed estimate. null = speed reported in
+  # pixels/second only, which is honest but not physically meaningful.
+  # Set it after measuring a known distance in your camera view.
+  pixels_per_metre: null
+
+# --------------------------------------------------------------------------
+# Virtual boundary lines
+# --------------------------------------------------------------------------
+# These govern WHEN a line crossing counts, not where the lines are. The
+# lines themselves are per-camera geometry and live in config/zones.yaml.
+lines:
+  # Minimum gap between two crossings of the same line by the same track.
+  # Stops someone standing on a boundary from producing a stream of alerts.
+  cooldown_seconds: 3.0
+  # Movement below this (fraction of frame) between two samples is treated
+  # as tracker jitter and cannot trigger a crossing.
+  min_travel: 0.004
+  # A track's first this-many seconds are not tested against any line.
+  #
+  # When an object is first detected its box is still converging - it grows
+  # as the person clears an occlusion or the frame edge - and the reference
+  # point moves for a reason that is not motion. On CAM-01 a person entering
+  # from behind the railing had his box bottom fall 0.13 of frame height in
+  # six frames, which registered as two crossings of the perimeter railing
+  # before he had taken a step, and those then swallowed his real vault
+  # thirty frames later under the cooldown above.
+  #
+  # The cost: a genuine crossing inside a track's first half second is
+  # missed. Set to 0.0 to disable the window if your cameras look at
+  # approaches long enough that no crossing can happen at track birth.
+  warmup_seconds: 0.5
+
+# --------------------------------------------------------------------------
+# Behaviour analysis
+# --------------------------------------------------------------------------
+behaviour:
+  # Seconds an object must dwell inside a zone before loitering is raised.
+  # Measured in FOOTAGE time, not processing time: a clip analysed slower
+  # than real time still reports the dwell the footage actually shows.
+  loitering_seconds: 8.0
+  # Movement radius (fraction of frame diagonal) below which an object is
+  # considered stationary for loitering purposes.
+  loitering_radius: 0.06
+  # A direction change is counted when heading turns by more than this.
+  direction_change_degrees: 45.0
+  # Smoothing window (samples) for speed and heading.
+  smoothing_window: 5
+
+# --------------------------------------------------------------------------
+# Behavioural anomaly detection (Isolation Forest)
+# --------------------------------------------------------------------------
+anomaly:
+  enabled: true
+  # Completed tracks needed before the model can be fitted. Below this the
+  # engine reports INSUFFICIENT_DATA instead of guessing.
+  min_samples: 25
+  # Expected proportion of anomalous tracks.
+  contamination: 0.10
+  n_estimators: 150
+  random_state: 42
+  # Refit after this many new completed tracks.
+  refit_every: 25
+  # Score below this (more negative = more unusual) marks a track ANOMALOUS.
+  decision_threshold: 0.0
+  # Persisted model, relative to models_dir.
+  model_file: "behaviour_anomaly.joblib"
+
+# --------------------------------------------------------------------------
+# Threat scoring
+# --------------------------------------------------------------------------
+# See config/threat_rules.yaml for the weights themselves.
+threat:
+  rules_file: "config/threat_rules.yaml"
+
+# --------------------------------------------------------------------------
+# ANPR / licence plate recognition
+# --------------------------------------------------------------------------
+anpr:
+  enabled: true
+  # "auto" tries EasyOCR, then Tesseract, then disables itself and says so.
+  # Force with "easyocr" or "tesseract".
+  ocr_backend: "auto"
+  # Minimum OCR confidence to accept a plate string. Below this the plate is
+  # recorded as UNREADABLE and the crop is still saved as evidence.
+  min_ocr_confidence: 0.45
+  # Minimum vehicle box height in pixels before ANPR is attempted. Plates on
+  # small distant vehicles are not resolvable.
+  min_vehicle_height: 90
+  # Do not re-run OCR on the same track more often than this.
+  cooldown_seconds: 3.0
+  # Attempts per track before giving up.
+  max_attempts_per_track: 6
+  # Regex a candidate must match to be accepted. The default is a permissive
+  # Indian-plate shape. Set to null to accept any alphanumeric result.
+  plate_regex: "^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{3,4}$"
+  # Accept results that fail the regex but pass the confidence check.
+  # They are stored with validated=false so you can tell them apart.
+  accept_unvalidated: true
+
+# --------------------------------------------------------------------------
+# Evidence capture
+# --------------------------------------------------------------------------
+evidence:
+  enabled: true
+  # Only capture for incidents at or above this level.
+  min_threat_level: "MEDIUM"
+  # Full annotated frame, and/or a crop around the object.
+  save_full_frame: true
+  save_crop: true
+  crop_padding: 0.25
+  jpeg_quality: 90
+  # Do not write more than one evidence set per track per this many seconds.
+  cooldown_seconds: 10.0
+  # Delete evidence files older than this. 0 = keep forever.
+  retention_days: 30
+
+# --------------------------------------------------------------------------
+# Incidents and alerts
+# --------------------------------------------------------------------------
+incidents:
+  # Suppress a repeat incident of the same type for the same track for this
+  # many seconds. This is what stops one person generating 400 alerts.
+  dedupe_seconds: 20.0
+  # Raise the threat score of an existing open incident rather than opening a
+  # new one, when the same track re-triggers within the dedupe window.
+  escalate_existing: true
+
+alerts:
+  # Alerts at or above this level pop a toast in the GUI.
+  toast_min_level: "HIGH"
+  # Optional system sound on CRITICAL.
+  sound_on_critical: false
+  # Rows kept in the live alert feed widget.
+  feed_size: 200
+
+# --------------------------------------------------------------------------
+# Pose estimation
+# --------------------------------------------------------------------------
+# Body keypoints for people the tracker has already confirmed. Pose runs on a
+# CROP of each person's box, not on the whole frame, so it reuses the identity
+# ByteTrack assigned instead of finding its own people and needing them
+# reconciled.
+#
+# Pose gives landmarks. It does NOT give behaviour. Deciding that a posture
+# means something needs it held over time and read against the scene, which is
+# the behaviour layer's job.
+#
+# The three settings that control cost are max_persons_per_frame,
+# interval_frames and image_size. Raise them for accuracy, lower them for
+# headroom when running several cameras at once.
+pose:
+  enabled: true
+  # Any Ultralytics pose model in models/. The n variant is the lightest.
+  model_file: "yolov8n-pose.pt"
+  # Blank or "auto" follows detection.device.
+  device: "auto"
+  # Inference size for the CROP, not the frame. A person crop is small, so
+  # this can be far below the detector's 640 without losing joints.
+  image_size: 192
+  # A keypoint scoring below this is reported but marked not visible.
+  keypoint_threshold: 0.30
+  # Skip anyone shorter than this fraction of the frame height. Below roughly
+  # a tenth of the frame there are no recoverable joints, only confident noise.
+  min_box_height: 0.12
+  # And skip anyone shorter than this in absolute pixels, so a 4K frame
+  # cannot pass a tiny figure on the fraction rule alone.
+  min_crop_pixels: 48
+  # Most people processed in one frame, largest first. A crowd degrades
+  # predictably rather than stalling the pipeline.
+  max_persons_per_frame: 4
+  # Run pose every Nth ANALYSED frame. Posture changes over hundreds of
+  # milliseconds, so 2 or 3 costs very little accuracy.
+  interval_frames: 2
+
+# --------------------------------------------------------------------------
+# Person activity analysis
+# --------------------------------------------------------------------------
+# Pose landmarks over time, turned into named behaviours. The chain is
+# deliberately four separate stages, each testable on its own:
+#
+#   PoseEstimator -> PoseHistory -> MovementAnalyzer -> BehaviourClassifier
+#
+# The classifier is RULE-BASED. There is no trained action-recognition model
+# in this project and none is implied. Every threshold below is a documented
+# comparison, which is what makes an alert explainable.
+#
+# Distances are measured in the person's OWN standing height rather than in
+# frame units, so the same thresholds work at any distance and on any camera
+# without per-camera tuning. A speed of 1.0 means the person moved their own
+# height in one second.
+activity:
+  enabled: true
+
+  history:
+    # Seconds of pose kept per person. Behaviour is a recent-past question.
+    window_seconds: 3.0
+    # Hard cap on samples per person, so a long-lived track cannot grow
+    # without bound.
+    max_samples: 90
+
+  movement:
+    # Minimum evidence before any behaviour is reported at all. Below these
+    # the answer is UNKNOWN, not a guess.
+    min_samples: 4
+    min_duration: 0.25
+    # Keypoints that must be visible. A person half out of frame produces
+    # fewer, and their geometry cannot be trusted.
+    min_support: 6
+    # Pose from a box smaller than this is not trusted for behaviour. The
+    # pose estimator has its own gate; this sits just above it so a track
+    # hovering on that gate cannot feed marginal readings into behaviour.
+    min_box_height: 0.14
+    # Window the speeds are measured over.
+    window_seconds: 1.0
+    # Below this speed nobody is credited with a direction of travel.
+    stationary_speed: 0.15
+
+  behaviour:
+    # Postural, as a fraction of the person's own upright measurement.
+    # hip_ratio is hip-above-ankle height: 1.0 upright, lower is more folded.
+    crouch_hip_ratio: 0.62
+    sit_hip_ratio: 0.78
+    # Overall body height, for crawling.
+    crawl_height_ratio: 0.45
+    crawl_torso_degrees: 55.0
+    # BENDING: torso over this far from vertical while the hips stay UP.
+    # That is what separates bending from crouching, where the hips drop.
+    bend_torso_degrees: 50.0
+
+    # Gait, in body heights per second. These come from human gait: a walk is
+    # roughly 1.4 m/s against a 1.7 m frame, a run comfortably over 3 m/s.
+    walk_speed: 0.45
+    run_speed: 1.9
+
+    # Vertical rates for the short, dramatic events.
+    jump_rise_speed: 1.2
+    fall_speed: 1.6
+    fall_torso_degrees: 50.0
+
+    # Knee bend in degrees. 180 is a straight leg.
+    bent_knee_degrees: 125.0
+
+    # Debounce. A candidate behaviour must hold this long before it is
+    # believed, which is what stops one noisy frame raising an event.
+    # Falls and jumps get the shorter hold because they are over quickly.
+    hold_seconds: 0.30
+    event_hold_seconds: 0.15
+
+  # ------------------------------------------------------------------
+  # Person-to-boundary relationship
+  # ------------------------------------------------------------------
+  # Decides whether a tracked person has anything to do with the security
+  # boundaries configured for THEIR camera in zones.yaml. Proximity alone is
+  # not interaction: somebody walking a path beside a fence is near it for
+  # the whole clip.
+  #
+  #   NONE -> APPROACHING -> AT_BOUNDARY -> INTERACTING -> CROSSED
+  #
+  # This module does NOT find fences. There is no fence class in the
+  # detector, and nothing in the pixels says which linear structure is a
+  # security boundary - that is a fact about the site. Boundaries are
+  # configured per camera by an operator. The AI is identical everywhere;
+  # only the geometry differs.
+  #
+  # Every distance is in the person's OWN body heights, so the same setting
+  # means the same real-world distance at any camera distance.
+  boundary:
+    # Beyond this the person is not considered to be engaging at all.
+    engage_distance: 1.6
+    # Within this they are at the boundary rather than approaching it.
+    near_distance: 0.55
+    # A wrist must end up closer than this to the boundary...
+    hand_reach: 0.35
+    # ...AND have moved at least this far towards it compared with where this
+    # person's wrists normally sit. Closeness alone is not enough: a
+    # horizontal boundary above a standing person is always nearer their
+    # hands than their feet, so proximity would flag every passer-by.
+    hand_extension: 0.08
+    # Feet lifted this far above their own normal level suggest climbing...
+    climb_elevation: 0.18
+    # ...but ONLY if the person has stopped going anywhere. Running lifts the
+    # feet just as much: on real footage a runner passing the fence lifted
+    # them 0.47 of a body height and was flagged as interacting with it.
+    # A climber is not travelling at 1.5 body heights per second.
+    climb_max_speed: 0.60
+    # Distance must be closing at least this fast (negative) to count as an
+    # approach rather than someone simply standing nearby.
+    approach_rate: -0.15
+    # If the second-nearest boundary is less than this many times further
+    # away than the nearest, the answer is UNCERTAIN rather than an arbitrary
+    # pick. A RATIO rather than an absolute gap, so the test means the same
+    # thing whether the person is near the camera or far from it.
+    ambiguous_ratio: 1.35
+    # Debounce holds. A claimed crossing is held longer than an approach,
+    # because it is the one that can be faked by a tracker jitter.
+    hold_seconds: 0.35
+    crossed_hold_seconds: 0.50
+
+# --------------------------------------------------------------------------
+# Low-light detection
+# --------------------------------------------------------------------------
+# Whether the scene is dark is decided from the FRAMES, not from the clock.
+# Mean grayscale luminance is measured on a downscaled copy of each analysed
+# frame, averaged over a short rolling window, and compared against two
+# thresholds.
+#
+# Two thresholds, not one, on purpose. The scene must fall below enter_below
+# to count as low light, and must climb above exit_above to stop counting.
+# The gap between them is what stops the state flapping when the scene sits
+# right on the boundary at dusk. exit_above must be greater than enter_below.
+#
+# Luminance runs 0 (black) to 255 (white). Tune by watching the number the
+# backend reports for your own footage rather than guessing: a normally lit
+# outdoor scene reads well over 100, a dark one under 50.
+low_light:
+  enabled: true
+  # Below this smoothed luminance, the scene becomes low light.
+  enter_below: 60.0
+  # Above this smoothed luminance, it stops being low light.
+  exit_above: 80.0
+  # How many recent frames the rolling average covers.
+  window_frames: 15
+  # Frames needed before the detector will answer at all. Until then it
+  # reports "measuring" rather than guessing.
+  min_samples: 5
+  # Frames are shrunk to this width before measuring. Smaller is cheaper and
+  # the answer barely moves, because the shrink itself averages.
+  sample_width: 64
+
+# --------------------------------------------------------------------------
+# Night-time clock window
+# --------------------------------------------------------------------------
+# NOT used for threat scoring any more. Low-light context now comes from the
+# frames measured above. These values stay available for schedule-based
+# features and for ThreatEngine.is_night(), which is kept as a utility.
+schedule:
+  night_start_hour: 20
+  night_end_hour: 6
+
+# --------------------------------------------------------------------------
+# GUI
+# --------------------------------------------------------------------------
+gui:
+  theme: "dark"
+  # Target display rate for the video widget. Processing runs at its own
+  # pace in a worker thread; this only throttles repainting.
+  display_fps: 25
+  window_width: 1600
+  window_height: 950
+  # Draw these overlays on the camera view.
+  overlays:
+    boxes: true
+    labels: true
+    track_ids: true
+    trajectories: true
+    zones: true
+    lines: true
+    hud: true
+
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+logging:
+  level: "INFO"           # DEBUG | INFO | WARNING | ERROR
+  file: "logs/borderguard.log"
+  max_bytes: 5242880      # 5 MB per file
+  backup_count: 5
+  console: true
+  # System log rows mirrored into SQLite for the System Logs screen.
+  db_level: "INFO"

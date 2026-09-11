@@ -1,0 +1,678 @@
+from __future__ import annotations
+
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import cv2
+import yaml
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from core.config import load_config
+from core.pipeline import SurveillancePipeline
+from database.database import Database
+from inputs.factory import build_source, describe_source
+
+
+# ============================================================
+# APP
+# ============================================================
+
+app = FastAPI(
+    title="Border Guard AI API",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# PATHS / CONFIG
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CAMERAS_FILE = PROJECT_ROOT / "config" / "cameras.yaml"
+
+config = load_config()
+
+db = Database(
+    config.path("database_file")
+)
+
+
+# ============================================================
+# CAMERA RUNTIME
+# ============================================================
+
+class CameraRuntime:
+    def __init__(self, camera: dict[str, Any]):
+        self.camera = camera
+        self.camera_id = str(camera["id"])
+
+        self.source = None
+        self.pipeline = None
+        self.session_id = None
+
+        self.thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+
+        self.lock = threading.Lock()
+
+        self.latest_frame: bytes | None = None
+
+        self.stats = {
+            "camera_id": self.camera_id,
+            "status": "OFFLINE",
+            "frame_index": 0,
+            "persons": 0,
+            "vehicles": 0,
+            "tracks": 0,
+            "detections": 0,
+            "incidents": 0,
+            "alerts": 0,
+            "evidence": 0,
+            "plates": 0,
+            "fps": 0.0,
+            "inference_ms": 0.0,
+            "anomaly": "disabled",
+            "anpr": "disabled",
+            # Nothing has been measured before the camera starts, so these
+            # say so rather than defaulting to a comfortable "normal light".
+            "low_light": False,
+            "luminance": None,
+            "night_context": "Not started",
+            "error": None,
+        }
+
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+
+        self.stop_event.clear()
+
+        self.thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"camera-{self.camera_id}",
+        )
+
+        self.thread.start()
+
+    # --------------------------------------------------------
+    # STOP
+    # --------------------------------------------------------
+
+    def stop(self):
+        self.stop_event.set()
+
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=3)
+
+        self.stats["status"] = "OFFLINE"
+
+    # --------------------------------------------------------
+    # PROCESS CAMERA
+    # --------------------------------------------------------
+
+    def _run(self):
+
+        try:
+            self.stats["status"] = "CONNECTING"
+            self.stats["error"] = None
+
+            # ------------------------------------------------
+            # Open video source
+            # ------------------------------------------------
+
+            self.source = build_source(
+                self.camera,
+                input_dir=config.path("input_dir"),
+            )
+
+            self.source.open()
+
+            # ------------------------------------------------
+            # Database session
+            # ------------------------------------------------
+
+            self.session_id = db.start_session(
+                camera_id=self.camera_id,
+                source_detail=describe_source(self.camera),
+                model_path=str(config.model_path()),
+                device=str(
+                    config.get(
+                        "detection.device",
+                        "auto",
+                    )
+                ),
+            )
+
+            # ------------------------------------------------
+            # Existing AI pipeline
+            # ------------------------------------------------
+
+            self.pipeline = SurveillancePipeline(
+                config=config,
+                camera=self.camera,
+                database=db,
+                session_id=self.session_id,
+            )
+
+            self.pipeline.persist_zones()
+
+            self.stats["status"] = "ONLINE"
+
+            print(
+                f"[{self.camera_id}] AI pipeline started"
+            )
+
+            # ------------------------------------------------
+            # Main processing loop
+            # ------------------------------------------------
+
+            while not self.stop_event.is_set():
+
+                frame = self.source.read()
+
+                if frame is None:
+                    print(
+                        f"[{self.camera_id}] Video source ended"
+                    )
+                    break
+
+                try:
+                    output = self.pipeline.process(
+                        frame.image,
+                        frame.index,
+                        frame.ts,
+                    )
+
+                except Exception as exc:
+                    print(
+                        f"[{self.camera_id}] "
+                        f"Frame processing error: {exc}"
+                    )
+                    continue
+
+                # --------------------------------------------
+                # Statistics
+                # --------------------------------------------
+
+                self.stats.update(
+                    {
+                        "status": "ONLINE",
+                        "frame_index": output.frame_index,
+                        "persons": output.persons,
+                        "vehicles": output.vehicles,
+                        "tracks": self.pipeline.tracks.live_count,
+                        "detections": self.pipeline.stats.detections,
+                        "incidents": self.pipeline.stats.incidents,
+                        "alerts": self.pipeline.stats.alerts,
+                        "evidence": self.pipeline.stats.evidence_files,
+                        "plates": self.pipeline.stats.plates_read,
+                        "fps": self.pipeline.stats.fps,
+                        "inference_ms":
+                            self.pipeline.detector.stats.avg_inference_ms,
+                        "anomaly":
+                            self.pipeline.anomaly.status_text(),
+                        "anpr":
+                            self.pipeline.anpr.status_text(),
+                        # Scene context, measured from the frames by
+                        # core/low_light.py. Three flat keys alongside the
+                        # existing ones; the stats shape is unchanged.
+                        "low_light":
+                            self.pipeline.low_light_state.low_light,
+                        "luminance": (
+                            round(self.pipeline.low_light_state.luminance, 1)
+                            if self.pipeline.low_light_state.luminance
+                            is not None else None
+                        ),
+                        "night_context":
+                            self.pipeline.low_light_state.status_text(),
+                        "error": None,
+                    }
+                )
+
+                # --------------------------------------------
+                # Latest annotated frame
+                # --------------------------------------------
+
+                image = (
+                    output.annotated
+                    if output.annotated is not None
+                    else output.raw
+                )
+
+                if image is not None:
+
+                    success, encoded = cv2.imencode(
+                        ".jpg",
+                        image,
+                        [
+                            cv2.IMWRITE_JPEG_QUALITY,
+                            80,
+                        ],
+                    )
+
+                    if success:
+
+                        with self.lock:
+                            self.latest_frame = encoded.tobytes()
+
+                # Small yield so the API remains responsive
+                time.sleep(0.001)
+
+        except Exception as exc:
+
+            self.stats["status"] = "ERROR"
+            self.stats["error"] = str(exc)
+
+            print(
+                f"[{self.camera_id}] ERROR: {exc}"
+            )
+
+        finally:
+
+            # ------------------------------------------------
+            # Close video source
+            # ------------------------------------------------
+
+            if self.source is not None:
+                try:
+                    self.source.release()
+                except Exception:
+                    pass
+
+            # ------------------------------------------------
+            # Finalise AI pipeline
+            # ------------------------------------------------
+
+            if self.pipeline is not None:
+
+                try:
+                    self.pipeline.finalise()
+
+                    stats = self.pipeline.stats
+
+                    if self.session_id is not None:
+                        db.end_session(
+                            session_id=self.session_id,
+                            frames_read=stats.frames_read,
+                            frames_processed=stats.frames_processed,
+                            detections=stats.detections,
+                            incidents=stats.incidents,
+                        )
+
+                except Exception as exc:
+                    print(
+                        f"[{self.camera_id}] "
+                        f"Finalisation error: {exc}"
+                    )
+
+            self.stats["status"] = "OFFLINE"
+
+
+# ============================================================
+# LOAD CAMERAS
+# ============================================================
+
+def load_cameras():
+
+    with CAMERAS_FILE.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+
+        data = yaml.safe_load(file) or {}
+
+    return data.get("cameras", [])
+
+
+cameras = load_cameras()
+
+
+# ============================================================
+# CAMERA RUNTIMES
+# ============================================================
+
+runtimes: dict[str, CameraRuntime] = {}
+
+
+for camera in cameras:
+
+    camera_id = str(camera["id"])
+
+    runtimes[camera_id] = CameraRuntime(
+        camera
+    )
+
+    # Keep database camera list synchronized
+    source = camera.get("source", {})
+
+    source_type = str(
+        source.get("type", "")
+    )
+
+    if source_type == "video":
+        source_detail = str(
+            source.get("path", "")
+        )
+
+    elif source_type == "webcam":
+        source_detail = (
+            f"Camera {source.get('index', 0)}"
+        )
+
+    else:
+        source_detail = str(
+            source.get("url", "")
+        )
+
+    db.upsert_camera(
+        camera_id=camera_id,
+        name=str(
+            camera.get(
+                "name",
+                camera_id,
+            )
+        ),
+        location=camera.get("location"),
+        source_type=source_type,
+        source_detail=source_detail,
+        zones_profile=str(
+            camera.get(
+                "zones_profile",
+                "default",
+            )
+        ),
+        enabled=bool(
+            camera.get(
+                "enabled",
+                False,
+            )
+        ),
+    )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/")
+def root():
+
+    return {
+        "name": "Border Guard AI",
+        "status": "online",
+        "version": "1.0.0",
+    }
+
+
+@app.get("/api/health")
+def health():
+
+    return {
+        "status": "online",
+        "service": "Border Guard AI API",
+    }
+
+
+# ============================================================
+# CAMERAS
+# ============================================================
+
+@app.get("/api/cameras")
+def get_cameras():
+
+    result = []
+
+    for camera in cameras:
+
+        camera_id = str(camera["id"])
+        runtime = runtimes[camera_id]
+
+        result.append(
+            {
+                "id": camera_id,
+                "name": camera.get(
+                    "name",
+                    camera_id,
+                ),
+                "location": camera.get(
+                    "location",
+                    "",
+                ),
+                "enabled": camera.get(
+                    "enabled",
+                    False,
+                ),
+                "source": camera.get(
+                    "source",
+                    {},
+                ),
+                "status": runtime.stats[
+                    "status"
+                ],
+            }
+        )
+
+    return result
+
+
+# ============================================================
+# START CAMERA
+# ============================================================
+
+@app.post("/api/cameras/{camera_id}/start")
+def start_camera(camera_id: str):
+
+    if camera_id not in runtimes:
+        raise HTTPException(
+            status_code=404,
+            detail="Camera not found",
+        )
+
+    runtime = runtimes[camera_id]
+
+    runtime.start()
+
+    return {
+        "success": True,
+        "camera_id": camera_id,
+        "status": "STARTING",
+    }
+
+
+# ============================================================
+# STOP CAMERA
+# ============================================================
+
+@app.post("/api/cameras/{camera_id}/stop")
+def stop_camera(camera_id: str):
+
+    if camera_id not in runtimes:
+        raise HTTPException(
+            status_code=404,
+            detail="Camera not found",
+        )
+
+    runtime = runtimes[camera_id]
+
+    runtime.stop()
+
+    return {
+        "success": True,
+        "camera_id": camera_id,
+        "status": "OFFLINE",
+    }
+
+
+# ============================================================
+# CAMERA STATS
+# ============================================================
+
+@app.get("/api/cameras/{camera_id}/stats")
+def camera_stats(camera_id: str):
+
+    if camera_id not in runtimes:
+        raise HTTPException(
+            status_code=404,
+            detail="Camera not found",
+        )
+
+    return runtimes[camera_id].stats
+
+
+# ============================================================
+# LIVE MJPEG STREAM
+# ============================================================
+
+def generate_stream(runtime: CameraRuntime):
+
+    while True:
+
+        if runtime.stop_event.is_set():
+            break
+
+        with runtime.lock:
+            frame = runtime.latest_frame
+
+        if frame is None:
+            time.sleep(0.05)
+            continue
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n"
+            + frame
+            + b"\r\n"
+        )
+
+        time.sleep(0.03)
+
+
+@app.get("/api/cameras/{camera_id}/stream")
+def camera_stream(camera_id: str):
+
+    if camera_id not in runtimes:
+        raise HTTPException(
+            status_code=404,
+            detail="Camera not found",
+        )
+
+    runtime = runtimes[camera_id]
+
+    return StreamingResponse(
+        generate_stream(runtime),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+@app.get("/api/dashboard")
+def dashboard():
+
+    active_cameras = 0
+    persons = 0
+    vehicles = 0
+    tracks = 0
+    detections = 0
+    incidents = 0
+    alerts = 0
+
+    for runtime in runtimes.values():
+
+        stats = runtime.stats
+
+        if stats["status"] == "ONLINE":
+            active_cameras += 1
+
+        persons += int(stats["persons"])
+        vehicles += int(stats["vehicles"])
+        tracks += int(stats["tracks"])
+        detections += int(stats["detections"])
+        incidents += int(stats["incidents"])
+        alerts += int(stats["alerts"])
+
+    database_counts = db.analytics_counts()
+
+    return {
+        "cameras_active": active_cameras,
+        "persons": persons,
+        "vehicles": vehicles,
+        "tracks": tracks,
+        "detections": detections,
+        "incidents": incidents,
+        "alerts": alerts,
+        "database": database_counts,
+    }
+
+
+# ============================================================
+# ALERTS
+# ============================================================
+
+@app.get("/api/alerts")
+def alerts():
+
+    rows = db.get_alerts(
+        limit=100
+    )
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+# ============================================================
+# INCIDENTS
+# ============================================================
+
+@app.get("/api/incidents")
+def incidents():
+
+    rows = db.get_incidents(
+        limit=100
+    )
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+# ============================================================
+# PLATES
+# ============================================================
+
+@app.get("/api/plates")
+def plates():
+
+    rows = db.get_plates(
+        limit=100
+    )
+
+    return [
+        dict(row)
+        for row in rows
+    ]

@@ -1,0 +1,478 @@
+"""Configuration loading and validation.
+
+All operational parameters come from the YAML files in ``config/``. This
+module reads them, validates the values that would otherwise blow up deep
+inside the pipeline, and exposes them through a small dotted-key accessor.
+
+Design notes
+------------
+* A missing optional file degrades to a documented default rather than
+  crashing, and the degradation is reported through :attr:`AppConfig.warnings`
+  so the GUI and the logs can show it.
+* A malformed file is a hard error. Silently running with half a config is
+  worse than refusing to start.
+* :meth:`AppConfig.save` writes the application file back, which is what the
+  Settings screen uses. Comments in the YAML are lost on save; that is a
+  known and accepted trade-off of round-tripping with PyYAML.
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+import yaml
+
+from core.paths import CONFIG_DIR, PROJECT_ROOT, ensure_dir, resolve
+
+logger = logging.getLogger(__name__)
+
+
+class ConfigError(RuntimeError):
+    """Raised when configuration is present but unusable."""
+
+
+# ---------------------------------------------------------------------------
+# Minimal defaults
+# ---------------------------------------------------------------------------
+# These exist so the application can still start and explain itself if a
+# config file is deleted. They deliberately mirror the shipped YAML.
+
+_DEFAULT_APPLICATION: dict[str, Any] = {
+    "application": {"name": "Border Guard AI", "subtitle": "", "version": "1.0.0"},
+    "paths": {
+        "data_dir": "data",
+        "input_dir": "data/input",
+        "output_dir": "data/output",
+        "evidence_dir": "data/evidence",
+        "database_dir": "data/database",
+        "models_dir": "models",
+        "logs_dir": "logs",
+        "database_file": "data/database/borderguard.db",
+    },
+    "detection": {
+        "model_path": "yolov8n.pt",
+        "confidence": 0.35,
+        "iou": 0.50,
+        "image_size": 640,
+        "device": "auto",
+        "classes": [],
+        "vehicle_classes": ["car", "motorcycle", "bus", "truck"],
+        "person_classes": ["person"],
+        "frame_stride": 2,
+        "half": False,
+    },
+    "tracking": {
+        "tracker": "bytetrack",
+        "max_age_frames": 30,
+        "min_hits": 3,
+        "max_trajectory_points": 240,
+        "pixels_per_metre": None,
+    },
+    "behaviour": {
+        "loitering_seconds": 8.0,
+        "loitering_radius": 0.06,
+        "direction_change_degrees": 45.0,
+        "smoothing_window": 5,
+    },
+    "anomaly": {
+        "enabled": True,
+        "min_samples": 25,
+        "contamination": 0.10,
+        "n_estimators": 150,
+        "random_state": 42,
+        "refit_every": 25,
+        "decision_threshold": 0.0,
+        "model_file": "behaviour_anomaly.joblib",
+    },
+    "threat": {"rules_file": "config/threat_rules.yaml"},
+    "anpr": {
+        "enabled": True,
+        "ocr_backend": "auto",
+        "min_ocr_confidence": 0.45,
+        "min_vehicle_height": 90,
+        "cooldown_seconds": 3.0,
+        "max_attempts_per_track": 6,
+        "plate_regex": None,
+        "accept_unvalidated": True,
+    },
+    "evidence": {
+        "enabled": True,
+        "min_threat_level": "MEDIUM",
+        "save_full_frame": True,
+        "save_crop": True,
+        "crop_padding": 0.25,
+        "jpeg_quality": 90,
+        "cooldown_seconds": 10.0,
+        "retention_days": 30,
+    },
+    "incidents": {"dedupe_seconds": 20.0, "escalate_existing": True},
+    "alerts": {
+        "toast_min_level": "HIGH",
+        "sound_on_critical": False,
+        "feed_size": 200,
+    },
+    "schedule": {"night_start_hour": 20, "night_end_hour": 6},
+    "gui": {
+        "theme": "dark",
+        "display_fps": 25,
+        "window_width": 1600,
+        "window_height": 950,
+        "overlays": {
+            "boxes": True,
+            "labels": True,
+            "track_ids": True,
+            "trajectories": True,
+            "zones": True,
+            "lines": True,
+            "hud": True,
+        },
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "logs/borderguard.log",
+        "max_bytes": 5_242_880,
+        "backup_count": 5,
+        "console": True,
+        "db_level": "INFO",
+    },
+}
+
+THREAT_LEVELS: tuple[str, ...] = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into a copy of *base*."""
+    out = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _read_yaml(path: Path) -> dict:
+    """Load a YAML mapping, raising :class:`ConfigError` on malformed input."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{path.name} is not valid YAML: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Cannot read {path}: {exc}") from exc
+
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path.name} must contain a mapping at the top level")
+    return data
+
+
+@dataclass
+class AppConfig:
+    """The whole application configuration, already validated."""
+
+    data: dict[str, Any]
+    zones: dict[str, Any]
+    cameras: list[dict[str, Any]]
+    threat_rules: dict[str, Any]
+    source_file: Path
+    warnings: list[str] = field(default_factory=list)
+
+    # -- access ----------------------------------------------------------
+
+    def get(self, dotted: str, default: Any = None) -> Any:
+        """Fetch a value by dotted key, e.g. ``cfg.get("detection.confidence")``."""
+        node: Any = self.data
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    def set(self, dotted: str, value: Any) -> None:
+        """Set a value by dotted key, creating intermediate mappings."""
+        parts = dotted.split(".")
+        node = self.data
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise ConfigError(f"Cannot set {dotted}: {part} is not a mapping")
+        node[parts[-1]] = value
+
+    def section(self, name: str) -> dict[str, Any]:
+        """Return a whole top-level section as a plain dict."""
+        value = self.data.get(name, {})
+        return value if isinstance(value, dict) else {}
+
+    # -- derived paths ---------------------------------------------------
+
+    def path(self, key: str) -> Path:
+        """Resolve one of the entries under ``paths:`` to an absolute path."""
+        raw = self.get(f"paths.{key}")
+        if raw is None:
+            raise ConfigError(f"paths.{key} is not configured")
+        return resolve(raw)
+
+    def model_path(self) -> Path:
+        """Absolute path to the configured YOLO weights.
+
+        A bare filename is looked up inside ``models_dir``. Anything with a
+        separator, or an absolute path, is used as given. A name that is
+        neither on disk nor a known Ultralytics alias is returned unchanged so
+        the detector can produce a precise error.
+        """
+        raw = str(self.get("detection.model_path", "yolov8n.pt"))
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            return candidate
+        if len(candidate.parts) == 1:
+            return (self.path("models_dir") / candidate).resolve()
+        return resolve(candidate)
+
+    def ensure_directories(self) -> None:
+        """Create every directory the application writes to."""
+        for key in ("data_dir", "input_dir", "output_dir",
+                    "evidence_dir", "database_dir", "models_dir", "logs_dir"):
+            try:
+                ensure_dir(self.path(key))
+            except ConfigError:  # pragma: no cover - only when paths mangled
+                continue
+
+    # -- persistence -----------------------------------------------------
+
+    def save(self, path: Path | None = None) -> Path:
+        """Write the application section back to YAML.
+
+        Used by the Settings screen. Returns the path written.
+        """
+        target = path or self.source_file
+        ensure_dir(target.parent)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(self.data, handle, sort_keys=False,
+                           default_flow_style=False, allow_unicode=True)
+        tmp.replace(target)
+        logger.info("Configuration written to %s", target)
+        return target
+
+    # -- zone profiles ---------------------------------------------------
+
+    def zone_profile(self, name: str) -> dict[str, Any]:
+        """Return the named zone profile, or an empty one if unknown."""
+        profiles = self.zones.get("profiles", {})
+        profile = profiles.get(name)
+        if profile is None:
+            if name not in ("none",):
+                self.warnings.append(
+                    f"Zone profile '{name}' is not defined in zones.yaml; "
+                    "falling back to an empty profile."
+                )
+            return {"zones": [], "lines": []}
+        return {
+            "zones": profile.get("zones") or [],
+            "lines": profile.get("lines") or [],
+        }
+
+    def zone_profile_names(self) -> list[str]:
+        return sorted((self.zones.get("profiles") or {}).keys())
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _validate_range(cfg: AppConfig, dotted: str, low: float, high: float) -> None:
+    value = cfg.get(dotted)
+    if value is None:
+        return
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{dotted} must be a number, got {value!r}") from None
+    if not low <= numeric <= high:
+        raise ConfigError(f"{dotted} must be between {low} and {high}, got {numeric}")
+
+
+def _validate_positive_int(cfg: AppConfig, dotted: str, minimum: int = 1) -> None:
+    value = cfg.get(dotted)
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ConfigError(f"{dotted} must be an integer >= {minimum}, got {value!r}")
+
+
+def _validate_polygon(points: Any, where: str) -> None:
+    if not isinstance(points, Iterable):
+        raise ConfigError(f"{where}: polygon must be a list of points")
+    pts = list(points)
+    if len(pts) < 3:
+        raise ConfigError(f"{where}: a polygon needs at least 3 points, got {len(pts)}")
+    for point in pts:
+        if not (isinstance(point, (list, tuple)) and len(point) == 2):
+            raise ConfigError(f"{where}: each point must be [x, y], got {point!r}")
+        for coord in point:
+            if not isinstance(coord, (int, float)) or not 0.0 <= float(coord) <= 1.0:
+                raise ConfigError(
+                    f"{where}: coordinates must be normalised 0.0-1.0, got {coord!r}"
+                )
+
+
+def _validate(cfg: AppConfig) -> None:
+    """Check the values that would otherwise fail far from their source."""
+    _validate_range(cfg, "detection.confidence", 0.0, 1.0)
+    _validate_range(cfg, "detection.iou", 0.0, 1.0)
+    _validate_positive_int(cfg, "detection.image_size", 32)
+    _validate_positive_int(cfg, "detection.frame_stride", 1)
+    _validate_positive_int(cfg, "tracking.max_age_frames", 1)
+    _validate_positive_int(cfg, "tracking.min_hits", 1)
+    _validate_range(cfg, "anomaly.contamination", 0.0001, 0.5)
+    _validate_positive_int(cfg, "anomaly.min_samples", 5)
+    _validate_range(cfg, "anpr.min_ocr_confidence", 0.0, 1.0)
+    _validate_range(cfg, "behaviour.loitering_radius", 0.0, 1.0)
+    _validate_range(cfg, "evidence.crop_padding", 0.0, 2.0)
+
+    if cfg.get("behaviour.loitering_seconds", 1) <= 0:
+        raise ConfigError("behaviour.loitering_seconds must be greater than 0")
+
+    tracker = str(cfg.get("tracking.tracker", "bytetrack")).lower()
+    if tracker not in ("bytetrack", "botsort"):
+        raise ConfigError(
+            f"tracking.tracker must be 'bytetrack' or 'botsort', got {tracker!r}"
+        )
+
+    for dotted in ("evidence.min_threat_level", "alerts.toast_min_level"):
+        level = str(cfg.get(dotted, "MEDIUM")).upper()
+        if level not in THREAT_LEVELS:
+            raise ConfigError(
+                f"{dotted} must be one of {', '.join(THREAT_LEVELS)}, got {level!r}"
+            )
+
+    for hour_key in ("schedule.night_start_hour", "schedule.night_end_hour"):
+        hour = cfg.get(hour_key)
+        if hour is not None and not (isinstance(hour, int) and 0 <= hour <= 23):
+            raise ConfigError(f"{hour_key} must be an integer hour 0-23, got {hour!r}")
+
+    # Zone profiles
+    for profile_name, profile in (cfg.zones.get("profiles") or {}).items():
+        if not isinstance(profile, dict):
+            raise ConfigError(f"zones.yaml: profile '{profile_name}' must be a mapping")
+        for zone in profile.get("zones") or []:
+            where = f"zones.yaml profile '{profile_name}' zone '{zone.get('name', '?')}'"
+            if not zone.get("name"):
+                raise ConfigError(f"{where}: every zone needs a name")
+            _validate_polygon(zone.get("polygon"), where)
+        for line in profile.get("lines") or []:
+            where = f"zones.yaml profile '{profile_name}' line '{line.get('name', '?')}'"
+            for endpoint in ("start", "end"):
+                pt = line.get(endpoint)
+                if not (isinstance(pt, (list, tuple)) and len(pt) == 2):
+                    raise ConfigError(f"{where}: '{endpoint}' must be [x, y]")
+                for coord in pt:
+                    if not isinstance(coord, (int, float)) or not 0.0 <= coord <= 1.0:
+                        raise ConfigError(
+                            f"{where}: coordinates must be normalised 0.0-1.0"
+                        )
+            if list(line["start"]) == list(line["end"]):
+                raise ConfigError(f"{where}: start and end must differ")
+
+    # Cameras
+    seen_ids: set[str] = set()
+    for cam in cfg.cameras:
+        cam_id = cam.get("id")
+        if not cam_id:
+            raise ConfigError("cameras.yaml: every camera needs an 'id'")
+        if cam_id in seen_ids:
+            raise ConfigError(f"cameras.yaml: duplicate camera id '{cam_id}'")
+        seen_ids.add(cam_id)
+        source = cam.get("source")
+        if not isinstance(source, dict):
+            raise ConfigError(f"cameras.yaml: camera '{cam_id}' needs a 'source' block")
+        stype = str(source.get("type", "")).lower()
+        if stype not in ("video", "webcam", "rtsp"):
+            raise ConfigError(
+                f"cameras.yaml: camera '{cam_id}' has unknown source type {stype!r}; "
+                "expected video, webcam or rtsp"
+            )
+        if stype == "video" and not source.get("path"):
+            raise ConfigError(f"cameras.yaml: video camera '{cam_id}' needs a 'path'")
+        if stype == "rtsp" and not source.get("url"):
+            raise ConfigError(f"cameras.yaml: rtsp camera '{cam_id}' needs a 'url'")
+        if stype == "webcam" and not isinstance(source.get("index", 0), int):
+            raise ConfigError(f"cameras.yaml: webcam '{cam_id}' index must be an integer")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def load_config(config_dir: Path | None = None) -> AppConfig:
+    """Load and validate every configuration file.
+
+    Raises
+    ------
+    ConfigError
+        If a file exists but is malformed, or a value is out of range.
+    """
+    directory = config_dir or CONFIG_DIR
+    warnings: list[str] = []
+
+    app_file = directory / "application.yaml"
+    if app_file.exists():
+        raw_app = _read_yaml(app_file)
+    else:
+        warnings.append(
+            f"{app_file} not found; running on built-in defaults. "
+            "Detection and threat behaviour may not match your intent."
+        )
+        raw_app = {}
+    merged = _deep_merge(_DEFAULT_APPLICATION, raw_app)
+
+    zones_file = directory / "zones.yaml"
+    if zones_file.exists():
+        zones = _read_yaml(zones_file)
+    else:
+        warnings.append(f"{zones_file} not found; no zones or lines will be active.")
+        # No zones.yaml means no geometry anywhere, which is the safe answer:
+        # a camera with no configured polygon must not inherit one.
+        zones = {"profiles": {"none": {"zones": [], "lines": []}}}
+
+    cameras_file = directory / "cameras.yaml"
+    if cameras_file.exists():
+        cam_doc = _read_yaml(cameras_file)
+        cameras = cam_doc.get("cameras") or []
+        if not isinstance(cameras, list):
+            raise ConfigError("cameras.yaml: 'cameras' must be a list")
+    else:
+        warnings.append(
+            f"{cameras_file} not found; no cameras are configured. "
+            "Open a video from the Cameras screen to start."
+        )
+        cameras = []
+
+    rules_raw = merged.get("threat", {}).get("rules_file", "config/threat_rules.yaml")
+    rules_file = resolve(rules_raw, PROJECT_ROOT)
+    if rules_file.exists():
+        threat_rules = _read_yaml(rules_file)
+    else:
+        warnings.append(
+            f"{rules_file} not found; threat scoring is disabled and every "
+            "incident will be recorded at LOW."
+        )
+        threat_rules = {"factors": {}, "levels": {"LOW": 0}}
+
+    cfg = AppConfig(
+        data=merged,
+        zones=zones,
+        cameras=cameras,
+        threat_rules=threat_rules,
+        source_file=app_file,
+        warnings=warnings,
+    )
+    _validate(cfg)
+    cfg.ensure_directories()
+    return cfg

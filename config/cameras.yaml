@@ -1,0 +1,140 @@
+# ==========================================================================
+# Camera definitions
+# --------------------------------------------------------------------------
+# Each camera is a named input source. The AI pipeline is identical for all
+# source types - only the `source` block changes.
+#
+#   type: video    -> a local file. `path` is relative to data/input or absolute.
+#   type: webcam   -> `index` is the OpenCV device index (0 is usually built-in).
+#   type: rtsp     -> `url` is an rtsp:// address. Requires a real camera.
+#
+# RTSP entries can be defined now and enabled later. A camera with
+# `enabled: false` is listed in the GUI as CONFIGURED but never opened.
+# ==========================================================================
+
+cameras:
+  - id: "CAM-01"
+    name: "Sector Alpha - Perimeter Fence"
+    location: "Sector Alpha"
+    enabled: true
+    source:
+      type: video
+      # OWN-FILMED FOOTAGE. Cleared for the submission.
+      #
+      # Filmed by the team on an iPhone 16 from a fixed position. Measured
+      # camera drift across the whole clip is 1.7% of frame height, which
+      # is static enough to hold fixed zone geometry.
+      #
+      # The original .mov carried rotation=-90 metadata that OpenCV ignores.
+      # Read unrotated, the detector found a person in only 21% of frames;
+      # rotated correctly it finds one in 67%. The rotation is baked into
+      # the pixels in this file, so nothing downstream has to know.
+      path: "fence_own.mp4"
+      loop: false
+      target_fps: 30
+    # A real fence with a real protected area behind it, so unlike the
+    # hillside clip this camera has a genuine restricted zone rather than a
+    # designated line.
+    #
+    # The scene contains TWO green fences and the clip turns on telling them
+    # apart: a chain-link railing in the foreground, which PERSON #02 vaults
+    # at about frame 144, and a tall shade-net fence across the background,
+    # which nobody touches. A correct run reports exactly two incidents,
+    # both belonging to that vault, and nothing at all for PERSON #01, who
+    # walks the length of the same railing without going over it.
+    zones_profile: "own_fence"
+
+  - id: "CAM-02"
+    name: "Sector Bravo - Multi-person Evaluation Clip"
+    location: "Sector Bravo"
+    enabled: true
+    source:
+      type: video
+      path: "img_3894_eval.mp4"
+      # EVALUATION FOOTAGE - NOT CLEARED FOR THE SUBMISSION.
+      #
+      # This is a phone recording of a SCREEN playing film footage, not
+      # camera footage of a real place. Four independent signs, all
+      # measurable in the file:
+      #
+      #   * moire crosshatch across the sky and the sand, which only
+      #     appears when a camera photographs a display panel;
+      #   * black surround on all four sides with the panel edge visible -
+      #     row brightness 51 at the top row, 34 at row 960, bright in the
+      #     middle, which is a letterboxed video on a display;
+      #   * three shot cuts (2.8s, 7.0s, 10.3s). A fixed camera does not
+      #     cut between shots;
+      #   * content is a war film - soldiers, a machine gun, howitzers.
+      #
+      # It is here because it was asked for, and it is fine as a
+      # DEVELOPMENT input the way the Getty preview clips are. It must NOT
+      # appear in the demo video, the slide deck, the report, or anything
+      # submitted, and it must never be described as border surveillance
+      # data. It is somebody else's film.
+      #
+      # The previous source, "WhatsApp Video 2026-09-08 at 20.13.37.mp4"
+      # (Getty preview 1219650634, wall and patrol road), is still in
+      # data/input. Swap the path back and restore zones_profile
+      # "wall_sunset" to return this camera to it.
+      loop: false
+      target_fps: 30
+    # NO GEOMETRY, and this is not an oversight.
+    #
+    # A zone polygon and a boundary line describe a physical place seen
+    # from a fixed viewpoint. This clip changes viewpoint three times, so
+    # there is no single scene for geometry to describe. It also contains
+    # no fence, wall or barrier of any kind.
+    #
+    # Leaving the old "wall_sunset" profile here would have handed this
+    # camera polygons drawn for a completely different scene, which is
+    # exactly the defect that made an ordinary person standing mid-frame
+    # score a HIGH intrusion on an unconfigured camera.
+    #
+    # Detection, tracking, pose, movement and behaviour all still run.
+    # That is the architecture working as intended: the AI is identical on
+    # every camera, the geometry is not.
+    zones_profile: "none"
+
+  - id: "CAM-03"
+    name: "Sector Charlie - Border Wall"
+    location: "Sector Charlie"
+    enabled: true
+    source:
+      type: video
+      # EVALUATION FOOTAGE - NOT CLEARED FOR THE SUBMISSION.
+      #
+      # Getty Images preview file, asset 2075325506. The gettyimages
+      # watermark and the asset id are burned into the picture, and the
+      # recording includes the Getty player controls. A preview file is
+      # licensed for evaluation, which is what this is: real footage to
+      # develop and test the pipeline against.
+      #
+      # It must NOT appear in the demo video, the slide deck, or anything
+      # submitted. Replace it with your own filmed footage before then, or
+      # set enabled: false.
+      path: "WhatsApp Video 2026-09-08 at 20.12.55.mp4"
+      loop: false
+      target_fps: 25
+    zones_profile: "border_wall_diagonal"
+
+  # Template for a real CCTV stream. Fill in the URL and set enabled: true.
+  # No RTSP camera is needed for development - this entry is inert while
+  # disabled, and the GUI shows it as CONFIGURED (OFFLINE).
+  - id: "CAM-04"
+    name: "Perimeter CCTV (RTSP template)"
+    location: "Sector Charlie"
+    enabled: false
+    source:
+      type: rtsp
+      url: "rtsp://username:password@192.168.1.64:554/Streaming/Channels/101"
+      # Force TCP transport. UDP drops frames on lossy links.
+      transport: "tcp"
+      # Seconds to wait for the first frame before declaring the camera down.
+      open_timeout: 10
+      # Automatically try to reopen a dropped stream.
+      reconnect: true
+      reconnect_delay: 5
+      target_fps: null
+    # No geometry until this camera exists and someone draws polygons
+    # against its actual view.
+    zones_profile: "none"

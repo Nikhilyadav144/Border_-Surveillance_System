@@ -1,0 +1,421 @@
+# ==========================================================================
+# Zone and virtual line definitions
+# --------------------------------------------------------------------------
+# All coordinates are NORMALISED to the range 0.0 - 1.0.
+#   x = 0.0 is the left edge,  x = 1.0 is the right edge
+#   y = 0.0 is the TOP edge,   y = 1.0 is the bottom edge
+#
+# Normalised coordinates mean a profile works at any resolution and survives
+# a change of camera without being redrawn in pixels.
+#
+# A zone is a closed polygon: list its vertices in order. Three or more
+# points are required. Any shape is allowed, not just rectangles.
+#
+# Zone kinds and what they mean to the threat engine:
+#   RESTRICTED   any object inside is an intrusion
+#   BORDER       the line-of-control strip, entry is an intrusion
+#   NO_VEHICLE   only vehicles inside are a violation
+#   PATROL       friendly area, presence is logged but not scored
+#   OBSERVATION  general monitoring, presence is logged but not scored
+# ==========================================================================
+
+profiles:
+
+  # ------------------------------------------------------------------
+  # Geometry drawn for ONE specific clip: data/input/demo_border.mp4.
+  #
+  # This is NOT a default and nothing inherits it. It used to be named
+  # `default`, and cameras that did not name a profile silently picked it
+  # up - which meant an ordinary person standing mid-frame on an
+  # unconfigured camera landed inside "Restricted Compound" and scored a
+  # HIGH intrusion. A polygon describes a physical region of one camera's
+  # view; it is meaningless in another's.
+  #
+  # Use it only on a camera actually playing that clip.
+  # ------------------------------------------------------------------
+  demo_border_clip:
+    zones:
+      - name: "Border Strip"
+        kind: "BORDER"
+        colour: "#e5484d"
+        polygon:
+          - [0.00, 0.00]
+          - [1.00, 0.00]
+          - [1.00, 0.18]
+          - [0.00, 0.18]
+
+      - name: "Restricted Compound"
+        kind: "RESTRICTED"
+        colour: "#f76808"
+        polygon:
+          - [0.34, 0.30]
+          - [0.78, 0.30]
+          - [0.86, 0.72]
+          - [0.26, 0.72]
+
+      - name: "Vehicle Exclusion Area"
+        kind: "NO_VEHICLE"
+        colour: "#ffb224"
+        polygon:
+          - [0.02, 0.55]
+          - [0.24, 0.55]
+          - [0.24, 0.96]
+          - [0.02, 0.96]
+
+      - name: "Observation Area"
+        kind: "OBSERVATION"
+        colour: "#3e9b4f"
+        polygon:
+          - [0.00, 0.72]
+          - [1.00, 0.72]
+          - [1.00, 1.00]
+          - [0.00, 1.00]
+
+    lines:
+      - name: "Forward Boundary"
+        # A line is two points. `positive_direction` names the side that
+        # counts as "entering" for reporting purposes.
+        start: [0.00, 0.26]
+        end:   [1.00, 0.26]
+        colour: "#00b4d8"
+        # Which way is "in". Options: north, south, east, west.
+        # For a horizontal line, crossing upward (decreasing y) is north.
+        entering_direction: "north"
+
+      - name: "Eastern Checkpoint"
+        start: [0.72, 0.28]
+        end:   [0.72, 1.00]
+        colour: "#7c5cff"
+        entering_direction: "east"
+
+  # ------------------------------------------------------------------
+  # CAM-02: a perimeter fence running across the frame.
+  #
+  # The camera looks at a fence from the outside. Beyond the fence is the
+  # protected interior; in front of it is a patrol track, and in front of
+  # that is open ground.
+  #
+  #      y=0.00  ..................................................
+  #              :          RESTRICTED INTERIOR                   :
+  #      y=0.44  :................................................:
+  #      y=0.46  ============ PERIMETER FENCE LINE ================
+  #              :              PATROL TRACK                      :
+  #      y=0.78  :................................................:
+  #              :             OUTER APPROACH                     :
+  #      y=1.00  ..................................................
+  #
+  # The fence line sits at y=0.46. scripts/make_perimeter_video.py draws the
+  # fence at the same y. Change one and you must change the other.
+  #
+  # A person's position is the bottom-centre of their box - their feet - so
+  # these bands are read against where the person is standing, not where
+  # their head is.
+  # ------------------------------------------------------------------
+  perimeter_fence:
+    zones:
+      - name: "Restricted Interior"
+        kind: "RESTRICTED"
+        colour: "#e5484d"
+        polygon:
+          - [0.00, 0.00]
+          - [1.00, 0.00]
+          - [1.00, 0.44]
+          - [0.00, 0.44]
+
+      - name: "Patrol Track"
+        kind: "PATROL"
+        colour: "#3e9b4f"
+        polygon:
+          - [0.00, 0.48]
+          - [1.00, 0.48]
+          - [1.00, 0.78]
+          - [0.00, 0.78]
+
+      - name: "Outer Approach"
+        kind: "OBSERVATION"
+        colour: "#2ec4b6"
+        polygon:
+          - [0.00, 0.78]
+          - [1.00, 0.78]
+          - [1.00, 1.00]
+          - [0.00, 1.00]
+
+    lines:
+      - name: "Perimeter Fence Line"
+        start: [0.00, 0.46]
+        end:   [1.00, 0.46]
+        colour: "#00b4d8"
+        # Crossing upward (decreasing y) means going INTO the protected side.
+        entering_direction: "north"
+
+  # ------------------------------------------------------------------
+  # CAM-01: own-filmed perimeter fence (data/input/fence_own.mp4).
+  #
+  # The only footage in this project that the team filmed itself, so the
+  # only footage that can appear in the submission without a licensing
+  # caveat. iPhone 16, fixed position, measured camera drift 1.7% of frame
+  # height across the whole clip - static enough to hold fixed geometry.
+  #
+  # Portrait 608x1080. The scene has TWO green fences, and telling them
+  # apart is the whole point of this profile:
+  #
+  #   1. A tall dark-green SHADE-NET fence across the background. Its base
+  #      runs from (0.00, 0.57) on the left to (1.00, 0.66) on the right.
+  #      Nobody touches it in this clip.
+  #
+  #   2. A green CHAIN-LINK RAILING in the foreground, running diagonally
+  #      across the frame. Its ground line runs from (0.00, 1.00) at the
+  #      bottom-left to (1.00, 0.70) at the right. This is the one PERSON
+  #      #02 vaults over at about frame 144.
+  #
+  #      x=0.0                                          x=1.0
+  #       ---------------- shade-net fence base -------- y=0.57 .. 0.66
+  #       :          RESTRICTED - SPORTS COURT              :
+  #       :  (pink paved court, the protected side)         :
+  #       ================ CHAIN-LINK RAILING ==============  1.00 .. 0.70
+  #              WALKWAY (patrol side, people walk here)
+  #                                                        y=1.00
+  #
+  # The numbers above are MEASURED, not guessed. The railing's ground line
+  # was recovered by segmenting the bright green tube in HSV on a frame with
+  # nobody in it and taking the lowest green pixel per column: 0.999 at
+  # x=0.03 falling to 0.703 at x=0.98, a straight line to within a pixel.
+  # The shade-net base came from the same method on the dark-green netting.
+  #
+  # The line separates the two people correctly for the whole clip:
+  # PERSON #01 (white shirt) stays on the walkway side throughout, and
+  # PERSON #02 (maroon) starts on the walkway side, vaults the railing, and
+  # spends the rest of the clip inside the court. That flip is the security
+  # event this footage was filmed to demonstrate.
+  #
+  # HISTORY, because the mistake is instructive. This profile previously
+  # carried a single horizontal line at y=0.59, drawn on the SHADE-NET
+  # fence, and the railing was deliberately left out with a comment saying
+  # that configuring it "produced a false MEDIUM alarm because people step
+  # over that railing as part of walking the path". That reasoning was
+  # wrong twice over. Nobody steps over the railing casually - one person
+  # vaults it, once - and the alarm that was dismissed as a false positive
+  # was the real event. A horizontal line also cannot represent either
+  # fence here: both recede from the camera, so a person walking parallel
+  # to one appears to converge on it. With the old geometry PERSON #02 sat
+  # at AT_BOUNDARY for 110 consecutive frames while simply walking away
+  # down the court, which is exactly the "near a fence therefore engaged
+  # with it" behaviour this system is supposed to refuse.
+  # ------------------------------------------------------------------
+  own_fence:
+    zones:
+      # Between the two fences: the paved sports court. Reaching it means
+      # having crossed the railing, so presence here is a real intrusion.
+      - name: "Restricted - Sports Court"
+        kind: "RESTRICTED"
+        colour: "#e5484d"
+        polygon:
+          - [0.00, 1.00]
+          - [1.00, 0.70]
+          - [1.00, 0.66]
+          - [0.00, 0.57]
+
+      # Near side of the railing. Walking here is the normal, expected
+      # thing to do and is logged rather than scored.
+      - name: "Walkway"
+        kind: "PATROL"
+        colour: "#3e9b4f"
+        polygon:
+          - [0.00, 1.00]
+          - [1.00, 0.70]
+          - [1.00, 1.00]
+
+    lines:
+      # THE security boundary: the chain-link railing that is actually
+      # climbed. Its endpoints are the measured ground line, not the top
+      # rail, because a person's reference point is their feet.
+      - name: "Perimeter Railing"
+        start: [0.00, 1.00]
+        end:   [1.00, 0.70]
+        colour: "#00b4d8"
+        # Crossing upward, away from the camera, means going over the
+        # railing into the court.
+        entering_direction: "north"
+
+      # The second fence is configured on purpose, and on purpose it does
+      # NOT alert. The requirement is that the system discriminates between
+      # the boundaries in view rather than assuming the nearest or largest
+      # one is the security fence, and that can only be shown on footage
+      # containing more than one - so the analyzer needs to know this fence
+      # is here.
+      #
+      # It cannot be a crossing line, though, and the footage shows why.
+      # It sits in the BACKGROUND, above the strip of ground people walk on.
+      # A person's reference point is the bottom of their box, so when
+      # PERSON #02 lifted his feet to vault the railing 0.1 of a frame in
+      # front of this fence, his reference point swept across it and the
+      # crossing engine reported him going over a fence he never touched.
+      # A 2-D line test has no depth to tell those apart. Reference-only is
+      # the honest setting.
+      - name: "Court Net Fence"
+        start: [0.00, 0.57]
+        end:   [1.00, 0.66]
+        colour: "#7c5cff"
+        entering_direction: "north"
+        alerting: false
+
+  # ------------------------------------------------------------------
+  # CAM-01 evaluation footage: open hillside, soldiers moving through
+  # terrain. There is NO fence, wall or gate in this scene.
+  #
+  # So there is no restricted zone here, and inventing one would be
+  # exactly the arbitrary geometry this project refuses to draw. What
+  # there is instead is a DESIGNATED boundary line, the way an operator
+  # draws one on ground that has no physical barrier. The line has no
+  # real-world legal meaning; it means "tell me when someone crosses
+  # this". Crossing it is a real, observed event.
+  #
+  # y = 0.55 was chosen from the measured tracks, not by eye: two of the
+  # ten tracks in this clip genuinely traverse that height during the
+  # footage, one going up-slope and one down.
+  #
+  # Both bands are OBSERVATION, which is logged but never scored as an
+  # intrusion, because standing on a hillside is not a violation.
+  # ------------------------------------------------------------------
+  hillside_boundary:
+    zones:
+      - name: "Forward Slope"
+        kind: "OBSERVATION"
+        colour: "#2ec4b6"
+        polygon:
+          - [0.00, 0.00]
+          - [1.00, 0.00]
+          - [1.00, 0.53]
+          - [0.00, 0.53]
+
+      - name: "Lower Approach"
+        kind: "OBSERVATION"
+        colour: "#3e9b4f"
+        polygon:
+          - [0.00, 0.57]
+          - [1.00, 0.57]
+          - [1.00, 1.00]
+          - [0.00, 1.00]
+
+    lines:
+      - name: "Designated Boundary"
+        start: [0.00, 0.55]
+        end:   [1.00, 0.55]
+        colour: "#00b4d8"
+        # Up-slope, away from the camera, is the direction of interest.
+        entering_direction: "north"
+
+  # ------------------------------------------------------------------
+  # CAM-02 evaluation footage: a border wall at sunset, seen from above,
+  # receding to a vanishing point. A dirt patrol road runs below it.
+  #
+  # The wall base runs from roughly (0.00, 0.64) at the left edge to the
+  # vanishing point near (0.56, 0.52). Everything above that line is the
+  # far side; everything below is the road the patrol vehicle uses.
+  #
+  # Measured: both vehicles in this clip stay on the road side for the
+  # whole clip, so a correct run raises nothing. That is the point of
+  # having it - a vehicle doing its job must not trip an alarm.
+  # ------------------------------------------------------------------
+  wall_sunset:
+    zones:
+      - name: "Beyond the Wall"
+        kind: "RESTRICTED"
+        colour: "#e5484d"
+        polygon:
+          - [0.00, 0.00]
+          - [1.00, 0.00]
+          - [1.00, 0.45]
+          - [0.56, 0.51]
+          - [0.00, 0.64]
+
+      - name: "Patrol Road"
+        kind: "PATROL"
+        colour: "#3e9b4f"
+        polygon:
+          - [0.00, 0.66]
+          - [0.58, 0.53]
+          - [1.00, 0.60]
+          - [1.00, 1.00]
+          - [0.00, 1.00]
+
+    lines:
+      - name: "Wall Line"
+        start: [0.00, 0.64]
+        end:   [0.56, 0.52]
+        colour: "#00b4d8"
+        entering_direction: "north"
+
+  # ------------------------------------------------------------------
+  # A wall or fence running DIAGONALLY across the frame, seen from above
+  # and to one side. Drawn against the border-wall evaluation clip, where
+  # the wall base runs from about (0.13, 1.00) at the lower left up to
+  # (1.00, 0.26) at the right edge.
+  #
+  #      (0,0) .............................................
+  #            :  RESTRICTED - WALL SIDE           ....------  (1.00, 0.26)
+  #            :                        ....------
+  #            :          ....------
+  #            ....---                 PATROL TRACK
+  #      (0.13, 1.00) ................................... (1,1)
+  #
+  # Horizontal bands would be wrong here: at x=0.2 the wall base sits at
+  # y=0.95, and at x=0.9 it sits at y=0.32. One straight band would put the
+  # same y on both, which is the wall in one place and open ground in the
+  # other.
+  # ------------------------------------------------------------------
+  border_wall_diagonal:
+    zones:
+      - name: "Restricted - Wall Side"
+        kind: "RESTRICTED"
+        colour: "#e5484d"
+        polygon:
+          - [0.00, 0.00]
+          - [1.00, 0.00]
+          - [1.00, 0.24]
+          - [0.11, 0.98]
+          - [0.00, 0.98]
+
+      - name: "Patrol Track"
+        kind: "PATROL"
+        colour: "#3e9b4f"
+        polygon:
+          - [0.15, 1.00]
+          - [1.00, 0.28]
+          - [1.00, 1.00]
+
+    lines:
+      - name: "Wall Base Line"
+        start: [0.13, 1.00]
+        end:   [1.00, 0.26]
+        colour: "#00b4d8"
+        # Crossing towards the wall side is going IN.
+        entering_direction: "north"
+
+  # ------------------------------------------------------------------
+  # A minimal profile. Useful when testing with arbitrary footage where
+  # the default polygons make no sense.
+  # ------------------------------------------------------------------
+  simple_centre:
+    zones:
+      - name: "Central Restricted Area"
+        kind: "RESTRICTED"
+        colour: "#e5484d"
+        polygon:
+          - [0.30, 0.30]
+          - [0.70, 0.30]
+          - [0.70, 0.75]
+          - [0.30, 0.75]
+    lines:
+      - name: "Mid Line"
+        start: [0.00, 0.50]
+        end:   [1.00, 0.50]
+        colour: "#00b4d8"
+        entering_direction: "north"
+
+  # ------------------------------------------------------------------
+  # Empty profile: detection and tracking only, no zone or line events.
+  # ------------------------------------------------------------------
+  none:
+    zones: []
+    lines: []

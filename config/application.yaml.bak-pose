@@ -1,0 +1,270 @@
+# ==========================================================================
+# Border Guard AI - Application Configuration
+# --------------------------------------------------------------------------
+# Every operational parameter lives here. Nothing important is hard-coded in
+# the Python sources. Edit this file, or use the Settings screen in the GUI
+# (which writes back to this file).
+# ==========================================================================
+
+application:
+  name: "Border Guard AI"
+  subtitle: "Border Surveillance Command & Monitoring System"
+  # Prototype build identifier, shown in the About dialog.
+  version: "1.0.0"
+
+paths:
+  # All paths are relative to the project root unless absolute.
+  data_dir: "data"
+  input_dir: "data/input"
+  output_dir: "data/output"
+  evidence_dir: "data/evidence"
+  database_dir: "data/database"
+  models_dir: "models"
+  logs_dir: "logs"
+  database_file: "data/database/borderguard.db"
+
+# --------------------------------------------------------------------------
+# Object detection
+# --------------------------------------------------------------------------
+detection:
+  # Path to YOLO weights, relative to models_dir or absolute.
+  # yolov8n.pt is the stock COCO model: it knows person, car, motorcycle,
+  # bus, truck and 75 other everyday classes. It is the sensible default for
+  # ground-level and drone footage.
+  #
+  # border_yolo.pt is a custom 7-class model trained on aerial imagery
+  # (DOTA + xView + VisDrone). Only use it for top-down aerial footage.
+  # Its measured recall for 'person' is 0.28, so it misses most people in
+  # ground-level video.
+  model_path: "yolov8n.pt"
+
+  confidence: 0.35
+  iou: 0.50
+  image_size: 640
+
+  # "auto" picks CUDA, then Apple Silicon MPS, then CPU.
+  # Force a specific device with "cpu", "mps", "cuda:0".
+  device: "auto"
+
+  # Only these class names are processed. Names are matched against the
+  # class list of the model that is actually loaded. A name that the loaded
+  # model does not support is reported at startup and ignored - it is never
+  # silently invented.
+  # Leave the list empty to process every class the model supports.
+  classes:
+    - person
+    - car
+    - motorcycle
+    - bus
+    - truck
+    - bicycle
+
+  # Which of the above count as vehicles for ANPR and zone rules.
+  vehicle_classes:
+    - car
+    - motorcycle
+    - bus
+    - truck
+    - bicycle
+
+  person_classes:
+    - person
+
+  # Process every Nth frame. 1 = every frame. Raise it if playback stutters.
+  frame_stride: 2
+
+  # Half precision. Ignored on CPU and MPS.
+  half: false
+
+# --------------------------------------------------------------------------
+# Multi-object tracking
+# --------------------------------------------------------------------------
+tracking:
+  # "bytetrack" or "botsort". Both ship with Ultralytics.
+  tracker: "bytetrack"
+  # A track is dropped this many processed frames after its last detection.
+  max_age_frames: 30
+  # A track must be seen this many times before it can raise an incident.
+  min_hits: 3
+  # Trajectory points retained per track.
+  max_trajectory_points: 240
+  # Pixels-per-metre for the speed estimate. null = speed reported in
+  # pixels/second only, which is honest but not physically meaningful.
+  # Set it after measuring a known distance in your camera view.
+  pixels_per_metre: null
+
+# --------------------------------------------------------------------------
+# Behaviour analysis
+# --------------------------------------------------------------------------
+behaviour:
+  # Seconds an object must dwell inside a zone before loitering is raised.
+  # Measured in FOOTAGE time, not processing time: a clip analysed slower
+  # than real time still reports the dwell the footage actually shows.
+  loitering_seconds: 8.0
+  # Movement radius (fraction of frame diagonal) below which an object is
+  # considered stationary for loitering purposes.
+  loitering_radius: 0.06
+  # A direction change is counted when heading turns by more than this.
+  direction_change_degrees: 45.0
+  # Smoothing window (samples) for speed and heading.
+  smoothing_window: 5
+
+# --------------------------------------------------------------------------
+# Behavioural anomaly detection (Isolation Forest)
+# --------------------------------------------------------------------------
+anomaly:
+  enabled: true
+  # Completed tracks needed before the model can be fitted. Below this the
+  # engine reports INSUFFICIENT_DATA instead of guessing.
+  min_samples: 25
+  # Expected proportion of anomalous tracks.
+  contamination: 0.10
+  n_estimators: 150
+  random_state: 42
+  # Refit after this many new completed tracks.
+  refit_every: 25
+  # Score below this (more negative = more unusual) marks a track ANOMALOUS.
+  decision_threshold: 0.0
+  # Persisted model, relative to models_dir.
+  model_file: "behaviour_anomaly.joblib"
+
+# --------------------------------------------------------------------------
+# Threat scoring
+# --------------------------------------------------------------------------
+# See config/threat_rules.yaml for the weights themselves.
+threat:
+  rules_file: "config/threat_rules.yaml"
+
+# --------------------------------------------------------------------------
+# ANPR / licence plate recognition
+# --------------------------------------------------------------------------
+anpr:
+  enabled: true
+  # "auto" tries EasyOCR, then Tesseract, then disables itself and says so.
+  # Force with "easyocr" or "tesseract".
+  ocr_backend: "auto"
+  # Minimum OCR confidence to accept a plate string. Below this the plate is
+  # recorded as UNREADABLE and the crop is still saved as evidence.
+  min_ocr_confidence: 0.45
+  # Minimum vehicle box height in pixels before ANPR is attempted. Plates on
+  # small distant vehicles are not resolvable.
+  min_vehicle_height: 90
+  # Do not re-run OCR on the same track more often than this.
+  cooldown_seconds: 3.0
+  # Attempts per track before giving up.
+  max_attempts_per_track: 6
+  # Regex a candidate must match to be accepted. The default is a permissive
+  # Indian-plate shape. Set to null to accept any alphanumeric result.
+  plate_regex: "^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{3,4}$"
+  # Accept results that fail the regex but pass the confidence check.
+  # They are stored with validated=false so you can tell them apart.
+  accept_unvalidated: true
+
+# --------------------------------------------------------------------------
+# Evidence capture
+# --------------------------------------------------------------------------
+evidence:
+  enabled: true
+  # Only capture for incidents at or above this level.
+  min_threat_level: "MEDIUM"
+  # Full annotated frame, and/or a crop around the object.
+  save_full_frame: true
+  save_crop: true
+  crop_padding: 0.25
+  jpeg_quality: 90
+  # Do not write more than one evidence set per track per this many seconds.
+  cooldown_seconds: 10.0
+  # Delete evidence files older than this. 0 = keep forever.
+  retention_days: 30
+
+# --------------------------------------------------------------------------
+# Incidents and alerts
+# --------------------------------------------------------------------------
+incidents:
+  # Suppress a repeat incident of the same type for the same track for this
+  # many seconds. This is what stops one person generating 400 alerts.
+  dedupe_seconds: 20.0
+  # Raise the threat score of an existing open incident rather than opening a
+  # new one, when the same track re-triggers within the dedupe window.
+  escalate_existing: true
+
+alerts:
+  # Alerts at or above this level pop a toast in the GUI.
+  toast_min_level: "HIGH"
+  # Optional system sound on CRITICAL.
+  sound_on_critical: false
+  # Rows kept in the live alert feed widget.
+  feed_size: 200
+
+# --------------------------------------------------------------------------
+# Low-light detection
+# --------------------------------------------------------------------------
+# Whether the scene is dark is decided from the FRAMES, not from the clock.
+# Mean grayscale luminance is measured on a downscaled copy of each analysed
+# frame, averaged over a short rolling window, and compared against two
+# thresholds.
+#
+# Two thresholds, not one, on purpose. The scene must fall below enter_below
+# to count as low light, and must climb above exit_above to stop counting.
+# The gap between them is what stops the state flapping when the scene sits
+# right on the boundary at dusk. exit_above must be greater than enter_below.
+#
+# Luminance runs 0 (black) to 255 (white). Tune by watching the number the
+# backend reports for your own footage rather than guessing: a normally lit
+# outdoor scene reads well over 100, a dark one under 50.
+low_light:
+  enabled: true
+  # Below this smoothed luminance, the scene becomes low light.
+  enter_below: 60.0
+  # Above this smoothed luminance, it stops being low light.
+  exit_above: 80.0
+  # How many recent frames the rolling average covers.
+  window_frames: 15
+  # Frames needed before the detector will answer at all. Until then it
+  # reports "measuring" rather than guessing.
+  min_samples: 5
+  # Frames are shrunk to this width before measuring. Smaller is cheaper and
+  # the answer barely moves, because the shrink itself averages.
+  sample_width: 64
+
+# --------------------------------------------------------------------------
+# Night-time clock window
+# --------------------------------------------------------------------------
+# NOT used for threat scoring any more. Low-light context now comes from the
+# frames measured above. These values stay available for schedule-based
+# features and for ThreatEngine.is_night(), which is kept as a utility.
+schedule:
+  night_start_hour: 20
+  night_end_hour: 6
+
+# --------------------------------------------------------------------------
+# GUI
+# --------------------------------------------------------------------------
+gui:
+  theme: "dark"
+  # Target display rate for the video widget. Processing runs at its own
+  # pace in a worker thread; this only throttles repainting.
+  display_fps: 25
+  window_width: 1600
+  window_height: 950
+  # Draw these overlays on the camera view.
+  overlays:
+    boxes: true
+    labels: true
+    track_ids: true
+    trajectories: true
+    zones: true
+    lines: true
+    hud: true
+
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+logging:
+  level: "INFO"           # DEBUG | INFO | WARNING | ERROR
+  file: "logs/borderguard.log"
+  max_bytes: 5242880      # 5 MB per file
+  backup_count: 5
+  console: true
+  # System log rows mirrored into SQLite for the System Logs screen.
+  db_level: "INFO"

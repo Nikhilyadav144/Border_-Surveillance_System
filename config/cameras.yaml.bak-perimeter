@@ -1,0 +1,74 @@
+# ==========================================================================
+# Camera definitions
+# --------------------------------------------------------------------------
+# Each camera is a named input source. The AI pipeline is identical for all
+# source types - only the `source` block changes.
+#
+#   type: video    -> a local file. `path` is relative to data/input or absolute.
+#   type: webcam   -> `index` is the OpenCV device index (0 is usually built-in).
+#   type: rtsp     -> `url` is an rtsp:// address. Requires a real camera.
+#
+# RTSP entries can be defined now and enabled later. A camera with
+# `enabled: false` is listed in the GUI as CONFIGURED but never opened.
+# ==========================================================================
+
+cameras:
+  - id: "CAM-01"
+    name: "Sector Alpha - Main Approach"
+    location: "Sector Alpha"
+    enabled: true
+    source:
+      type: video
+      path: "demo_border.mp4"
+      # Loop the file so a short clip can run a long demo.
+      loop: false
+      # null = play as fast as the pipeline allows.
+      # A number throttles playback to that many frames per second.
+      target_fps: 25
+    zones_profile: "default"
+
+  - id: "CAM-02"
+    name: "Sector Bravo - Perimeter Fence"
+    location: "Sector Bravo"
+    enabled: true
+    source:
+      type: video
+      # TEMPORARY STAND-IN FOOTAGE.
+      # CAM-02 should have its own perimeter-fence clip. Until we have one,
+      # it reuses CAM-01's demo clip so the input path can be tested.
+      # The detections are real; the scene is not a perimeter fence.
+      # Replace with data/input/sample_02.mp4 when that footage exists.
+      path: "demo_border.mp4"
+      loop: false
+      target_fps: 25
+    zones_profile: "default"
+
+  - id: "CAM-03"
+    name: "Operator Workstation Webcam"
+    location: "Control Room"
+    enabled: false
+    source:
+      type: webcam
+      index: 0
+      target_fps: 20
+    zones_profile: "default"
+
+  # Template for a real CCTV stream. Fill in the URL and set enabled: true.
+  # No RTSP camera is needed for development - this entry is inert while
+  # disabled, and the GUI shows it as CONFIGURED (OFFLINE).
+  - id: "CAM-04"
+    name: "Perimeter CCTV (RTSP template)"
+    location: "Sector Charlie"
+    enabled: false
+    source:
+      type: rtsp
+      url: "rtsp://username:password@192.168.1.64:554/Streaming/Channels/101"
+      # Force TCP transport. UDP drops frames on lossy links.
+      transport: "tcp"
+      # Seconds to wait for the first frame before declaring the camera down.
+      open_timeout: 10
+      # Automatically try to reopen a dropped stream.
+      reconnect: true
+      reconnect_delay: 5
+      target_fps: null
+    zones_profile: "default"

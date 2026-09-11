@@ -1,0 +1,86 @@
+# =============================================================================
+# Border Guard AI - dependencies
+# =============================================================================
+# Python 3.11 recommended (3.9 minimum).
+#
+#   python3.11 -m venv venv
+#   source venv/bin/activate          # Windows: venv\Scripts\activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# Why the upper bounds: this project pins ranges rather than exact versions so
+# security fixes still arrive, but caps major versions because a major bump in
+# PySide6, OpenCV or Ultralytics has broken this kind of application before.
+# =============================================================================
+
+# --- Desktop interface -------------------------------------------------------
+PySide6>=6.5,<7.0
+
+# --- Computer vision ---------------------------------------------------------
+# opencv-python (not headless): the desktop build is the right one here, and
+# Ultralytics depends on it anyway. Installing both variants side by side is a
+# known source of confusing import behaviour, so pick one.
+opencv-python>=4.8,<5.0
+
+# --- Detection and tracking --------------------------------------------------
+# Ultralytics supplies YOLO plus the ByteTrack and BoT-SORT trackers.
+ultralytics>=8.2,<9.0
+# lap is what ByteTrack uses for assignment. Ultralytics installs it on first
+# use if missing; pinning it here avoids a surprise download mid-demo.
+lap>=0.5.12
+
+# --- Numerics and machine learning -------------------------------------------
+torch>=2.2,<3.0
+torchvision>=0.17,<1.0
+numpy>=1.24,<3.0
+scikit-learn>=1.3,<2.0
+scipy>=1.10,<2.0
+joblib>=1.3,<2.0
+
+# --- Data --------------------------------------------------------------------
+pandas>=2.0,<3.0
+PyYAML>=6.0,<7.0
+
+# --- Tests -------------------------------------------------------------------
+pytest>=7.4,<9.0
+
+# =============================================================================
+# OPTIONAL: number plate recognition (ANPR)
+# -----------------------------------------------------------------------------
+# ANPR is off unless one of these is installed. Without a backend the
+# application reports "No OCR backend installed" and everything else works.
+#
+# EasyOCR reads plates better. It is a large install and downloads about
+# 100 MB of weights the first time it runs (internet needed once):
+#
+#     pip install easyocr
+#
+# Tesseract is lighter but needs the system binary as well:
+#
+#     pip install pytesseract
+#     brew install tesseract            # macOS
+#     sudo apt install tesseract-ocr    # Debian / Ubuntu
+# =============================================================================
+
+# =============================================================================
+# PLATFORM NOTES
+# -----------------------------------------------------------------------------
+# macOS, Apple Silicon
+#   pip installs an MPS-capable PyTorch by default. Set detection.device to
+#   "auto" (the default) and the application uses the GPU when it can.
+#   The first webcam use triggers the system Camera permission prompt.
+#
+# macOS, Intel
+#   CPU inference only. Expect roughly 60-120 ms per frame with yolov8n.
+#   Raise detection.frame_stride if playback stutters.
+#
+# Linux
+#   If OpenCV fails to import with a libGL error:
+#       sudo apt install libgl1 libglib2.0-0
+#
+# NVIDIA GPU
+#   Install the CUDA build of PyTorch first, then the rest:
+#       pip install torch torchvision --index-url \
+#           https://download.pytorch.org/whl/cu121
+#   CUDA is never required.
+# =============================================================================

@@ -1,0 +1,47 @@
+        for track in people:
+            result = results.get(track.track_number)
+            if result is None:
+                # Pose was attempted and produced nothing usable for this
+                # person. Say so rather than leaving a stale reading looking
+                # current, and never invent landmarks.
+                if track.pose is None:
+                    track.pose_status = POSE_UNAVAILABLE
+                elif moment - track.pose_ts > 1.0:
+                    track.pose_status = POSE_STALE
+                continue
+            track.pose = result
+            track.posture = estimate_posture(result)
+            track.pose_ts = moment
+            track.pose_count += 1
+            track.pose_status = POSE_TRACKED
+
+            if not self.activity_enabled:
+                continue
+
+            # History -> signals -> behaviour, all keyed by the Track ID the
+            # tracker already assigned.
+            self.pose_history.record(track.track_number, result,
+                                     track.box, moment)
+            history = self.pose_history.get(track.track_number)
+            if history is None:
+                continue
+            signals = self.movement.analyse(history)
+            track.movement = signals
+            track.movement_direction = signals.direction
+
+            event = self.behaviour_classifier.update(signals)
+            state = self.behaviour_classifier.state(track.track_number)
+            if state is not None:
+                track.behaviour = state.behavior
+                track.behaviour_confidence = state.confidence
+                track.behaviour_duration = state.duration
+            if event is not None:
+                self.behaviour_events.append(event)
+                logger.info("%s %s", self.camera_id, event.describe())
+
+        # Histories and behaviour states outlive a single frame, so they must
+        # be released when the tracker retires an identity. Otherwise both
+        # dictionaries grow for the life of the process.
+        live = set(self.tracks.tracks)
+        self.pose_history.prune(live)
+        self.behaviour_classifier.prune(live)

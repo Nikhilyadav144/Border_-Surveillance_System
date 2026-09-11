@@ -1,0 +1,245 @@
+"""End-to-end acceptance: local video through to analytics.
+
+These tests run the real detector against the real demo clip, so they are slow
+(roughly 30 s each on a CPU) and they are skipped automatically when the clip
+or the model is missing. Everything asserted here is read back out of SQLite
+after the run, not taken from memory.
+
+Run only the fast tests with:   pytest -m "not slow"
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import cv2
+import pytest
+
+from core.config import load_config
+from core.pipeline import SurveillancePipeline
+from database.database import Database
+from database.models import IncidentStatus, IncidentType
+from inputs.factory import build_source
+
+pytestmark = pytest.mark.slow
+
+
+@pytest.fixture(scope="module")
+def processed(tmp_path_factory):
+    """Process the demo clip once and share the result across the tests."""
+    config = load_config()
+    if not config.model_path().exists():
+        pytest.skip(f"model weights not present at {config.model_path()}")
+
+    video = config.path("input_dir") / "demo_border.mp4"
+    if not video.exists():
+        pytest.skip("demo clip not built; run scripts/make_demo_video.py")
+
+    workspace = tmp_path_factory.mktemp("e2e")
+    config.set("paths.evidence_dir", str(workspace / "evidence"))
+    config.ensure_directories()
+
+    db = Database(workspace / "e2e.db")
+    camera = {
+        "id": "CAM-E2E", "name": "Acceptance", "location": "Test",
+        "zones_profile": "default",
+        "source": {"type": "video", "path": str(video), "target_fps": None},
+    }
+    db.upsert_camera("CAM-E2E", "Acceptance", "Test", "video", str(video))
+    session_id = db.start_session("CAM-E2E", str(video),
+                                  str(config.model_path()), "auto")
+
+    pipeline = SurveillancePipeline(config=config, camera=camera,
+                                    database=db, session_id=session_id)
+    pipeline.persist_zones()
+
+    source = build_source(camera, input_dir=config.path("input_dir"))
+    source.open()
+    outputs = []
+    try:
+        for frame in source:
+            outputs.append(pipeline.process(frame.image, frame.index, frame.ts))
+    finally:
+        source.release()
+        pipeline.finalise()
+
+    db.end_session(session_id, pipeline.stats.frames_read,
+                   pipeline.stats.frames_processed,
+                   pipeline.stats.detections, pipeline.stats.incidents)
+
+    yield {"db": db, "pipeline": pipeline, "outputs": outputs,
+           "config": config, "workspace": workspace}
+    db.close()
+
+
+class TestAcceptanceChain:
+    """LOCAL VIDEO -> ... -> ANALYTICS, one link per test."""
+
+    def test_01_frames_were_captured(self, processed):
+        assert processed["pipeline"].stats.frames_read > 100
+
+    def test_02_yolo_produced_real_detections(self, processed):
+        assert processed["pipeline"].stats.detections > 0
+        detections = [d for out in processed["outputs"] for d in out.detections]
+        assert detections
+        assert all(0.0 <= d.confidence <= 1.0 for d in detections)
+
+    def test_03_class_names_come_from_the_model(self, processed):
+        detector = processed["pipeline"].detector
+        names = set(detector.supported_class_names)
+        assert "person" in names
+        seen = {d.class_name for out in processed["outputs"]
+                for d in out.detections}
+        assert seen <= names          # nothing invented
+
+    def test_04_tracker_assigned_persistent_identities(self, processed):
+        pipeline = processed["pipeline"]
+        assert pipeline.tracks.total_created > 0
+        # A new identity per frame would mean tracking is not working.
+        assert pipeline.tracks.total_created < pipeline.stats.frames_processed / 4
+
+    def test_05_tracks_reached_the_database(self, processed):
+        rows = processed["db"].get_tracks()
+        assert rows
+        assert any(int(row["frames_seen"]) > 10 for row in rows)
+        assert all(row["track_key"] for row in rows)
+
+    def test_06_zone_analysis_produced_intrusions(self, processed):
+        counts = processed["db"].analytics_counts()
+        assert counts["intrusions"] > 0
+
+    def test_07_line_crossing_was_detected(self, processed):
+        counts = processed["db"].analytics_counts()
+        assert counts["line_crossings"] > 0
+
+    def test_08_loitering_was_detected_temporally(self, processed):
+        """The person stands still for 12 s of footage in the demo clip."""
+        rows = processed["db"].get_incidents(
+            incident_type=IncidentType.LOITERING)
+        assert rows
+        import json
+        detail = json.loads(rows[0]["detail"])
+        assert detail["duration_seconds"] >= processed["config"].get(
+            "behaviour.loitering_seconds")
+
+    def test_09_anomaly_engine_is_honest_about_its_state(self, processed):
+        """With few completed tracks it must say so, not invent a score."""
+        pipeline = processed["pipeline"]
+        rows = processed["db"].get_tracks()
+        statuses = {row["anomaly_status"] for row in rows}
+        assert statuses <= {"INSUFFICIENT_DATA", "NORMAL", "ANOMALOUS",
+                            "DISABLED"}
+        if not pipeline.anomaly.is_fitted:
+            assert statuses == {"INSUFFICIENT_DATA"}
+            assert all(row["anomaly_score"] is None for row in rows)
+
+    def test_10_threat_scores_are_explainable(self, processed):
+        import json
+        for row in processed["db"].get_incidents(limit=50):
+            reasons = json.loads(row["reasons"])
+            assert reasons, f"incident {row['id']} has a score but no reasons"
+            total = sum(float(r["points"]) for r in reasons)
+            assert min(total, 100.0) == pytest.approx(
+                float(row["threat_score"]), abs=0.01)
+
+    def test_11_one_event_produces_one_incident_not_hundreds(self, processed):
+        """Suppression is what makes the alert list usable.
+
+        The person stands inside the restricted zone for around 240 frames.
+        A naive implementation raises an intrusion incident on every one of
+        them. Two mechanisms prevent that: the zone engine only emits an
+        `enter` event on an actual boundary crossing, and the incident manager
+        deduplicates anything that slips past it. This asserts the outcome
+        those two together are supposed to produce.
+        """
+        db = processed["db"]
+        pipeline = processed["pipeline"]
+
+        assert db.count_incidents() > 0
+        assert db.count_incidents() < 40, (
+            f"{db.count_incidents()} incidents from "
+            f"{pipeline.stats.frames_processed} frames looks like a flood"
+        )
+
+        # No single track may hold more than a couple of incidents of any one
+        # type: that is exactly the per-frame repetition we are guarding against.
+        rows = db.query(
+            "SELECT track_number, incident_type, COUNT(*) AS n FROM incidents "
+            "GROUP BY track_number, incident_type ORDER BY n DESC"
+        )
+        assert rows
+        assert int(rows[0]["n"]) <= 2, (
+            f"track {rows[0]['track_number']} raised {rows[0]['n']} "
+            f"{rows[0]['incident_type']} incidents"
+        )
+
+    def test_12_evidence_was_written_to_disk_and_indexed(self, processed):
+        rows = processed["db"].get_evidence(limit=200)
+        assert rows
+        for row in rows:
+            assert Path(row["file_path"]).exists()
+            assert int(row["bytes"]) > 0
+
+    def test_13_alerts_were_raised_for_every_incident(self, processed):
+        db = processed["db"]
+        assert len(db.get_alerts(limit=500)) == db.count_incidents()
+
+    def test_14_incident_lifecycle_works(self, processed):
+        db = processed["db"]
+        pipeline = processed["pipeline"]
+        incident_id = int(db.get_incidents(status=IncidentStatus.NEW,
+                                           limit=1)[0]["id"])
+        pipeline.incidents.acknowledge(incident_id, operator="pytest")
+        assert db.get_incident(incident_id)["status"] == \
+            IncidentStatus.ACKNOWLEDGED
+        pipeline.incidents.resolve(incident_id, operator="pytest", note="ok")
+        assert db.get_incident(incident_id)["status"] == IncidentStatus.RESOLVED
+
+    def test_15_analytics_report_real_data(self, processed):
+        db = processed["db"]
+        assert db.analytics_by_level()
+        assert db.analytics_by_type()
+        assert db.analytics_busiest_camera()[0] == "CAM-E2E"
+        assert sum(count for _, count in db.analytics_hourly()) == \
+            db.count_incidents()
+
+    def test_16_annotated_frames_were_produced(self, processed):
+        annotated = [o.annotated for o in processed["outputs"]
+                     if o.annotated is not None]
+        assert annotated
+        assert annotated[0].shape == processed["outputs"][0].raw.shape
+
+    def test_17_no_detection_outlives_its_frame(self, processed):
+        """Every persisted detection box is inside the frame, normalised."""
+        for row in processed["db"].query(
+                "SELECT x1, y1, x2, y2 FROM detections LIMIT 500"):
+            assert 0.0 <= row["x1"] <= 1.0
+            assert 0.0 <= row["y1"] <= 1.0
+            assert row["x2"] >= row["x1"]
+            assert row["y2"] >= row["y1"]
+
+
+class TestPipelineRobustness:
+    def test_a_corrupt_frame_does_not_kill_the_pipeline(self, tmp_path):
+        """One bad frame must be survivable: cameras produce them."""
+        import numpy as np
+
+        config = load_config()
+        if not config.model_path().exists():
+            pytest.skip("model weights not present")
+
+        db = Database(tmp_path / "robust.db")
+        camera = {"id": "CAM-R", "zones_profile": "default",
+                  "source": {"type": "video", "path": "x.mp4"}}
+        pipeline = SurveillancePipeline(config, camera, database=db)
+
+        good = np.full((240, 320, 3), 120, np.uint8)
+        assert pipeline.process(good, 1, time.time()) is not None
+
+        with pytest.raises(Exception):
+            pipeline.process(np.zeros((0, 0, 3), np.uint8), 2, time.time())
+
+        # Still usable afterwards.
+        assert pipeline.process(good, 3, time.time()) is not None
+        db.close()

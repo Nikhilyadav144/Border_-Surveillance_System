@@ -1,0 +1,610 @@
+"""The main window: navigation shell, worker orchestration, shared context.
+
+Responsibilities, and nothing else:
+
+* build the sidebar and the stacked pages
+* own the single :class:`PipelineWorker` and route its signals to the pages
+* expose an :class:`AppContext` so pages can reach the database and the
+  configuration without importing each other
+* keep the title bar and status bar honest about what the system is doing
+
+No computer vision happens here, and no page talks to the worker directly.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import (
+    QButtonGroup,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QStackedWidget,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.gui.pages.alerts import AlertsPage
+from app.gui.pages.analytics import AnalyticsPage
+from app.gui.pages.cameras import CamerasPage
+from app.gui.pages.dashboard import DashboardPage
+from app.gui.pages.evidence import EvidencePage
+from app.gui.pages.incidents import IncidentsPage
+from app.gui.pages.logs import LogsPage
+from app.gui.pages.settings import SettingsPage
+from app.gui.pages.watchlist import WatchlistPage
+from app.gui.theme import Palette, mono_font, ui_font
+from app.gui.widgets.common import StatusDot, Toast
+from app.workers.pipeline_worker import PipelineWorker
+from core.config import AppConfig, load_config
+from core.evidence import EvidenceManager
+from database.models import CameraStatus, IncidentStatus, ThreatLevel
+
+logger = logging.getLogger(__name__)
+
+
+class AppContext:
+    """What every page is allowed to reach.
+
+    A deliberately small surface. Pages get the configuration, the database
+    and a handful of callbacks; they do not get the worker, the pipeline or
+    each other.
+    """
+
+    def __init__(self, config: AppConfig, db: Any, window: "MainWindow") -> None:
+        self.config = config
+        self.db = db
+        self._window = window
+        self.detector_info: dict[str, Any] = {}
+        self.anomaly_status: str = ""
+        self.anpr_status: str = ""
+
+    # -- incident workflow -------------------------------------------------
+
+    def acknowledge_incident(self, incident_id: int) -> None:
+        self._window.acknowledge_incident(incident_id)
+
+    def resolve_incident(self, incident_id: int) -> None:
+        self._window.resolve_incident(incident_id)
+
+    # -- notifications -----------------------------------------------------
+
+    def watchlist_changed(self) -> None:
+        self._window.reload_watchlist()
+
+    def settings_changed(self) -> None:
+        self._window.reload_config()
+
+    def purge_evidence(self, paths: list[str]) -> int:
+        return self._window.purge_evidence(paths)
+
+
+class NavButton(QPushButton):
+    """One sidebar entry."""
+
+    def __init__(self, label: str, parent=None) -> None:
+        super().__init__(label, parent)
+        self.setObjectName("NavButton")
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(40)
+
+
+class MainWindow(QMainWindow):
+    """Border Guard AI command centre."""
+
+    def __init__(self, config: AppConfig, db: Any) -> None:
+        super().__init__()
+        self.config = config
+        self.db = db
+        self.ctx = AppContext(config, db, self)
+
+        self.worker: Optional[PipelineWorker] = None
+        self._toasts: list[Toast] = []
+        self._session_started: Optional[float] = None
+
+        self.setWindowTitle(
+            f"{config.get('application.name', 'Border Guard AI')} - "
+            f"{config.get('application.subtitle', '')}"
+        )
+        self.resize(int(config.get("gui.window_width", 1600)),
+                    int(config.get("gui.window_height", 950)))
+        self.setMinimumSize(1180, 720)
+
+        self._register_cameras()
+        self._build_ui()
+        self._wire_pages()
+        self._start_timers()
+        self._report_config_warnings()
+
+        logger.info("Command centre ready")
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        outer.addWidget(self._build_title_bar())
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self._build_sidebar())
+
+        self.stack = QStackedWidget()
+        body.addWidget(self.stack, 1)
+        outer.addLayout(body, 1)
+
+        self.setCentralWidget(central)
+        self._build_pages()
+        self._build_status_bar()
+
+    def _build_title_bar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("TitleBar")
+        bar.setFixedHeight(58)
+
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(18, 8, 18, 8)
+        layout.setSpacing(12)
+
+        # Team mark, drawn from app/resources. A missing file must not stop
+        # the window opening, so the logo is added only if it loaded.
+        logo_path = Path(__file__).resolve().parents[2] / "app" / "resources" \
+            / "logo-mark.png"
+        if logo_path.exists():
+            pixmap = QPixmap(str(logo_path))
+            if not pixmap.isNull():
+                mark = QLabel()
+                mark.setPixmap(pixmap.scaledToHeight(
+                    34, Qt.SmoothTransformation))
+                mark.setFixedWidth(52)
+                mark.setAlignment(Qt.AlignCenter)
+                layout.addWidget(mark)
+
+        titles = QVBoxLayout()
+        titles.setSpacing(0)
+        title = QLabel(str(self.config.get("application.name", "IBVAP")).upper())
+        title.setObjectName("AppTitle")
+        team = str(self.config.get("application.team", "")).strip()
+        subtitle_text = str(self.config.get("application.subtitle", ""))
+        if team:
+            subtitle_text = f"{subtitle_text}   |   {team}"
+        subtitle = QLabel(subtitle_text)
+        subtitle.setObjectName("AppSubtitle")
+        titles.addWidget(title)
+        titles.addWidget(subtitle)
+        layout.addLayout(titles)
+        layout.addStretch(1)
+
+        self.threat_banner = QLabel("THREAT LEVEL  LOW")
+        self.threat_banner.setFont(ui_font(11, bold=True, spacing=1.4))
+        self.threat_banner.setStyleSheet(f"color: {Palette.LOW};")
+        layout.addWidget(self.threat_banner)
+        layout.addSpacing(20)
+
+        self.system_dot = StatusDot(Palette.ONLINE, 10)
+        self.system_label = QLabel("SYSTEM READY")
+        self.system_label.setFont(ui_font(11, bold=True, spacing=1.2))
+        self.system_label.setStyleSheet(f"color: {Palette.ONLINE};")
+        layout.addWidget(self.system_dot)
+        layout.addWidget(self.system_label)
+        layout.addSpacing(20)
+
+        self.clock = QLabel("")
+        self.clock.setFont(mono_font(12))
+        self.clock.setStyleSheet(f"color: {Palette.TEXT_MUTED};")
+        layout.addWidget(self.clock)
+
+        return bar
+
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(196)
+
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(0, 12, 0, 12)
+        layout.setSpacing(2)
+
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        self.nav_buttons: list[NavButton] = []
+
+        for index, label in enumerate((
+            "  Dashboard", "  Cameras", "  Incidents", "  Alerts",
+            "  Watchlist", "  Analytics", "  Evidence", "  Settings",
+            "  System Logs",
+        )):
+            button = NavButton(label)
+            button.clicked.connect(lambda _=False, i=index: self.go_to(i))
+            self.nav_group.addButton(button, index)
+            self.nav_buttons.append(button)
+            layout.addWidget(button)
+
+        layout.addStretch(1)
+
+        self.nav_alert_badge = QLabel("")
+        self.nav_alert_badge.setAlignment(Qt.AlignCenter)
+        self.nav_alert_badge.setObjectName("Dim")
+        self.nav_alert_badge.setWordWrap(True)
+        layout.addWidget(self.nav_alert_badge)
+
+        version = QLabel(f"  v{self.config.get('application.version', '1.0.0')}"
+                         f"  ·  prototype")
+        version.setObjectName("Dim")
+        layout.addWidget(version)
+
+        return sidebar
+
+    def _build_pages(self) -> None:
+        self.page_dashboard = DashboardPage(self.ctx)
+        self.page_cameras = CamerasPage(self.ctx)
+        self.page_incidents = IncidentsPage(self.ctx)
+        self.page_alerts = AlertsPage(self.ctx)
+        self.page_watchlist = WatchlistPage(self.ctx)
+        self.page_analytics = AnalyticsPage(self.ctx)
+        self.page_evidence = EvidencePage(self.ctx)
+        self.page_settings = SettingsPage(self.ctx)
+        self.page_logs = LogsPage(self.ctx)
+
+        self.pages = [
+            self.page_dashboard, self.page_cameras, self.page_incidents,
+            self.page_alerts, self.page_watchlist, self.page_analytics,
+            self.page_evidence, self.page_settings, self.page_logs,
+        ]
+        for page in self.pages:
+            self.stack.addWidget(page)
+
+        self.nav_buttons[0].setChecked(True)
+        self.go_to(0)
+
+    def _build_status_bar(self) -> None:
+        bar = QStatusBar()
+        self.setStatusBar(bar)
+
+        self.status_message = QLabel("Ready")
+        self.status_detail = QLabel("")
+        self.status_detail.setFont(mono_font(9))
+        self.status_detail.setStyleSheet(f"color: {Palette.TEXT_DIM};")
+
+        bar.addWidget(self.status_message, 1)
+        bar.addPermanentWidget(self.status_detail)
+
+    def _wire_pages(self) -> None:
+        self.page_cameras.start_requested.connect(self.start_processing)
+        self.page_cameras.stop_requested.connect(self.stop_processing)
+        self.page_cameras.pause_requested.connect(self._pause)
+        self.page_cameras.resume_requested.connect(self._resume)
+        self.page_alerts.open_incident.connect(self._open_incident)
+
+    def _start_timers(self) -> None:
+        self.clock_timer = QTimer(self)
+        self.clock_timer.timeout.connect(self._tick_clock)
+        self.clock_timer.start(1000)
+        self._tick_clock()
+
+        # Slow refresh so pages stay current without polling hard.
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self._refresh_current_page)
+        self.refresh_timer.start(4000)
+
+    def _register_cameras(self) -> None:
+        """Mirror cameras.yaml into the database so health can be tracked."""
+        if self.db is None:
+            return
+        from inputs.factory import describe_source
+        for camera in self.config.cameras:
+            try:
+                self.db.upsert_camera(
+                    camera_id=str(camera.get("id")),
+                    name=str(camera.get("name", camera.get("id"))),
+                    location=camera.get("location"),
+                    source_type=str(camera.get("source", {}).get("type", "video")),
+                    source_detail=describe_source(camera),
+                    zones_profile=str(camera.get("zones_profile", "none")),
+                    enabled=bool(camera.get("enabled", True)),
+                    status=(CameraStatus.OFFLINE if camera.get("enabled", True)
+                            else CameraStatus.CONFIGURED),
+                )
+            except Exception as exc:
+                logger.error("Could not register camera %s: %s",
+                             camera.get("id"), exc)
+
+    def _report_config_warnings(self) -> None:
+        for warning in self.config.warnings:
+            logger.warning("Configuration: %s", warning)
+        if self.config.warnings:
+            self.status_message.setText(
+                f"{len(self.config.warnings)} configuration warning(s) - "
+                f"see System Logs"
+            )
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+
+    def go_to(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+        self.nav_buttons[index].setChecked(True)
+        try:
+            self.pages[index].refresh()
+        except Exception as exc:
+            logger.error("Refreshing %s failed: %s",
+                         self.pages[index].title, exc, exc_info=True)
+
+    def _refresh_current_page(self) -> None:
+        page = self.stack.currentWidget()
+        if page is None:
+            return
+        try:
+            page.refresh()
+        except Exception as exc:
+            logger.debug("Background refresh failed: %s", exc)
+        self._update_banner()
+
+    def _open_incident(self, incident_id: int) -> None:
+        self.go_to(2)
+        self.page_incidents.show_incident(incident_id)
+
+    # ------------------------------------------------------------------
+    # Processing control
+    # ------------------------------------------------------------------
+
+    def start_processing(self, camera: dict) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(
+                self, "Already processing",
+                "Stop the current camera before starting another one.\n\n"
+                "This build processes one camera at a time on purpose: the "
+                "architecture supports more, but running several YOLO streams "
+                "on a laptop CPU makes all of them useless.",
+            )
+            return
+
+        camera_id = str(camera.get("id", "CAM"))
+        logger.info("Starting processing for %s", camera_id)
+        self._session_started = time.time()
+
+        self.worker = PipelineWorker(self.config, camera, self.db, parent=self)
+        self.worker.frame_ready.connect(self.page_cameras.on_frame)
+        self.worker.status_changed.connect(self.page_cameras.on_status)
+        self.worker.status_changed.connect(self._on_status)
+        self.worker.progress_changed.connect(self.page_cameras.on_progress)
+        self.worker.health_changed.connect(self.page_cameras.on_health)
+        self.worker.incident_raised.connect(self._on_incident)
+        self.worker.alert_raised.connect(self._on_alert)
+        self.worker.error_raised.connect(self._on_error)
+        self.worker.session_finished.connect(self._on_session_finished)
+        self.worker.pipeline_ready.connect(self._on_pipeline_ready)
+        self.worker.frame_ready.connect(self._on_frame_stats)
+        self.worker.started.connect(
+            lambda: self.page_cameras.on_started(camera_id))
+
+        self.worker.start()
+        self.status_message.setText(f"Processing {camera_id}…")
+        self._set_system_state("PROCESSING", Palette.ACCENT)
+
+    def stop_processing(self) -> None:
+        if self.worker is None or not self.worker.isRunning():
+            return
+        self.status_message.setText("Stopping…")
+        self.worker.stop()
+
+    def _pause(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.pause()
+
+    def _resume(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.resume()
+
+    # ------------------------------------------------------------------
+    # Worker signals
+    # ------------------------------------------------------------------
+
+    def _on_pipeline_ready(self, info: dict) -> None:
+        """The worker has built its pipeline: publish what it actually loaded."""
+        self.ctx.detector_info = info.get("detector", {})
+        self.ctx.anomaly_status = info.get("anomaly", "")
+        self.ctx.anpr_status = info.get("anpr", "")
+        detector = self.ctx.detector_info
+        logger.info(
+            "Pipeline ready: %s on %s, %d classes active",
+            detector.get("model"), detector.get("device_label"),
+            len(detector.get("active_classes") or []),
+        )
+        unsupported = detector.get("unsupported_requested") or []
+        if unsupported:
+            self._show_toast(
+                "These configured classes are not supported by the loaded "
+                f"model and were ignored: {', '.join(unsupported)}",
+                "MEDIUM",
+            )
+        self.status_detail.setText(
+            f"{detector.get('model', '')} · {detector.get('device', '')}"
+        )
+
+    def _on_frame_stats(self, _frame, stats: dict) -> None:
+        """Keep the live engine status in the shared context up to date."""
+        self.ctx.anomaly_status = stats.get("anomaly", self.ctx.anomaly_status)
+        self.ctx.anpr_status = stats.get("anpr", self.ctx.anpr_status)
+
+    def _on_status(self, camera_id: str, status: str) -> None:
+        self.status_message.setText(f"{camera_id}: {status}")
+
+    def _on_incident(self, incident) -> None:
+        """A new incident. Refresh the visible page and update the banner."""
+        self._update_banner()
+        current = self.stack.currentWidget()
+        if current in (self.page_dashboard, self.page_incidents,
+                       self.page_alerts, self.page_analytics):
+            try:
+                current.refresh()
+            except Exception:
+                pass
+
+    def _on_alert(self, alert, incident) -> None:
+        """An alert was dispatched. Toast it if it is severe enough."""
+        minimum = str(self.config.get("alerts.toast_min_level", "HIGH"))
+        if ThreatLevel.at_least(alert.severity, minimum):
+            self._show_toast(
+                f"{alert.message}  ·  {alert.camera_id}", alert.severity
+            )
+        self._update_banner()
+
+    def _on_error(self, message: str) -> None:
+        logger.error("Worker reported: %s", message)
+        self.status_message.setText("Error - see System Logs")
+        self._show_toast(message.split("\n")[0], "CRITICAL")
+
+    def _on_session_finished(self, summary: dict) -> None:
+        self.page_cameras.on_stopped()
+        self._set_system_state("SYSTEM READY", Palette.ONLINE)
+
+        if "error" in summary:
+            self.status_message.setText(f"Stopped: {summary['error'][:90]}")
+            QMessageBox.warning(
+                self, "Processing could not start", str(summary["error"])
+            )
+        else:
+            elapsed = summary.get("elapsed", 0.0)
+            self.status_message.setText(
+                f"Finished {summary.get('camera_id', '')}: "
+                f"{summary.get('frames_processed', 0)} frames analysed, "
+                f"{summary.get('incidents', 0)} incidents, "
+                f"{summary.get('evidence', 0)} evidence files "
+                f"in {elapsed:.0f}s"
+            )
+        self.worker = None
+        self._refresh_current_page()
+
+    # ------------------------------------------------------------------
+    # Context callbacks
+    # ------------------------------------------------------------------
+
+    def acknowledge_incident(self, incident_id: int) -> None:
+        if self.db is None:
+            return
+        self.db.set_incident_status(incident_id, IncidentStatus.ACKNOWLEDGED)
+        logger.info("Incident #%s acknowledged by the operator", incident_id)
+        self._update_banner()
+
+    def resolve_incident(self, incident_id: int) -> None:
+        if self.db is None:
+            return
+        self.db.set_incident_status(
+            incident_id, IncidentStatus.RESOLVED,
+            note="Resolved from the command centre",
+        )
+        logger.info("Incident #%s resolved by the operator", incident_id)
+        if self.worker is not None and self.worker.pipeline is not None:
+            self.worker.pipeline.incidents.resolve(incident_id)
+        self._update_banner()
+
+    def reload_watchlist(self) -> None:
+        if self.worker is not None and self.worker.pipeline is not None:
+            self.worker.pipeline.refresh_watchlist()
+            logger.info("Watchlist reloaded into the running pipeline")
+
+    def reload_config(self) -> None:
+        try:
+            self.config = load_config()
+            self.ctx.config = self.config
+            logger.info("Configuration reloaded from disk")
+            self.status_message.setText(
+                "Settings saved. Detection changes apply on the next Start."
+            )
+        except Exception as exc:
+            logger.error("Could not reload configuration: %s", exc)
+            QMessageBox.critical(
+                self, "Configuration error",
+                f"The saved configuration could not be reloaded:\n\n{exc}",
+            )
+
+    def purge_evidence(self, paths: list[str]) -> int:
+        manager = EvidenceManager(
+            evidence_dir=self.config.path("evidence_dir"),
+            retention_days=int(self.config.get("evidence.retention_days", 30)),
+        )
+        return manager.purge(paths)
+
+    # ------------------------------------------------------------------
+    # Chrome
+    # ------------------------------------------------------------------
+
+    def _tick_clock(self) -> None:
+        self.clock.setText(time.strftime("%a %d %b %Y   %H:%M:%S"))
+        if self.worker is not None and self.worker.isRunning() \
+                and self._session_started:
+            elapsed = time.time() - self._session_started
+            self.status_detail.setText(
+                f"session {int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+            )
+
+    def _set_system_state(self, text: str, colour: str) -> None:
+        self.system_label.setText(text)
+        self.system_label.setStyleSheet(f"color: {colour};")
+        self.system_dot.set_colour(colour)
+
+    def _update_banner(self) -> None:
+        if self.db is None:
+            return
+        try:
+            level = self.db.highest_open_threat()
+            active = self.db.count_active_alerts()
+        except Exception:
+            return
+        self.threat_banner.setText(f"THREAT LEVEL  {level}")
+        self.threat_banner.setStyleSheet(f"color: {Palette.threat(level)};")
+        self.nav_alert_badge.setText(
+            f"{active} alert(s)\nawaiting action" if active else ""
+        )
+        self.nav_alert_badge.setStyleSheet(
+            f"color: {Palette.HIGH};" if active else ""
+        )
+
+    def _show_toast(self, message: str, level: str) -> None:
+        toast = Toast(self, message, level)
+        self._toasts = [t for t in self._toasts if t.isVisible()]
+        offset = 74 + len(self._toasts) * 74
+        toast.move(self.width() - toast.width() - 22, offset)
+        toast.show()
+        toast.raise_()
+        self._toasts.append(toast)
+
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self.worker is not None and self.worker.isRunning():
+            answer = QMessageBox.question(
+                self, "Processing is running",
+                "A camera is still being processed. Stop it and exit?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            self.worker.stop()
+            if not self.worker.wait(8000):
+                logger.warning("Worker did not stop in time; terminating")
+                self.worker.terminate()
+                self.worker.wait(2000)
+
+        logger.info("Application shutting down")
+        event.accept()

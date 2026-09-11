@@ -1,0 +1,954 @@
+"""The surveillance pipeline.
+
+One class wires every engine together for one camera:
+
+    frame
+      -> detector.track()            YOLO + ByteTrack, real identities
+      -> TrackManager                trajectory, speed, heading, dwell
+      -> ZoneEngine                  polygon occupancy, intrusion events
+      -> LineCrossingEngine          virtual boundary crossings
+      -> BehaviourEngine             loitering, behavioural features
+      -> AnomalyEngine               Isolation Forest over those features
+      -> ThreatEngine                explainable score and level
+      -> IncidentManager             dedupe, escalate, persist
+      -> EvidenceManager             snapshot on disk
+      -> AlertManager                notify the operator
+      -> Database                    everything above, queryable
+
+This module contains no Qt. It runs identically inside the GUI worker thread
+and in a headless script, which is what makes the acceptance test in
+``scripts/run_acceptance.py`` meaningful.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+import numpy as np
+
+from core.alert_manager import AlertManager, DesktopChannel, LogChannel
+from core.annotator import Annotator
+from core.anomaly_engine import STATUS_ANOMALOUS, AnomalyEngine
+from core.anpr import AnprEngine
+from core.behaviour_engine import BehaviourEngine
+from core.config import AppConfig
+from core.detector import ObjectDetector
+from core.evidence import EvidenceManager
+from core.incident_manager import IncidentManager
+from core.line_crossing import LineCrossingEngine
+from core.threat_engine import ThreatContext, ThreatEngine
+from core.tracker import TrackManager, TrackState
+from core.watchlist import WatchlistMatcher, entries_from_rows
+from core.zone_engine import ZoneEngine, ZoneKind
+from database.models import (
+    Detection,
+    Incident,
+    IncidentType,
+    PlateRead,
+    ThreatLevel,
+    TrackRecord,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PipelineStats:
+    """Counters for the HUD, the camera health panel and the session record."""
+
+    frames_read: int = 0
+    frames_processed: int = 0
+    detections: int = 0
+    incidents: int = 0
+    alerts: int = 0
+    evidence_files: int = 0
+    plates_read: int = 0
+    started_ts: float = field(default_factory=time.time)
+    last_frame_ts: float = 0.0
+    _fps_window: list[float] = field(default_factory=list)
+
+    def note_frame(self, ts: float) -> None:
+        if self.last_frame_ts:
+            delta = ts - self.last_frame_ts
+            if delta > 0:
+                self._fps_window.append(delta)
+                if len(self._fps_window) > 30:
+                    self._fps_window.pop(0)
+        self.last_frame_ts = ts
+
+    @property
+    def fps(self) -> float:
+        if not self._fps_window:
+            return 0.0
+        mean = sum(self._fps_window) / len(self._fps_window)
+        return 1.0 / mean if mean > 0 else 0.0
+
+    @property
+    def elapsed(self) -> float:
+        return max(0.0, time.time() - self.started_ts)
+
+
+@dataclass
+class FrameOutput:
+    """What the pipeline produced for one frame."""
+
+    frame_index: int
+    ts: float
+    annotated: Optional[np.ndarray]
+    raw: Optional[np.ndarray]
+    tracks: list[TrackState] = field(default_factory=list)
+    detections: list[Detection] = field(default_factory=list)
+    incidents: list[Incident] = field(default_factory=list)
+    persons: int = 0
+    vehicles: int = 0
+    inference_ms: float = 0.0
+    skipped: bool = False
+
+
+class SurveillancePipeline:
+    """Own every engine for one camera and drive them frame by frame."""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        camera: dict[str, Any],
+        database: Any = None,
+        detector: Optional[ObjectDetector] = None,
+        session_id: Optional[int] = None,
+        annotate: bool = True,
+    ) -> None:
+        self.config = config
+        self.camera = camera
+        self.camera_id = str(camera.get("id", "CAM-01"))
+        self.db = database
+        self.session_id = session_id
+        self.annotate = annotate
+
+        det_cfg = config.section("detection")
+        self.vehicle_classes = {
+            c.lower() for c in det_cfg.get("vehicle_classes", [])
+        }
+        self.person_classes = {
+            c.lower() for c in det_cfg.get("person_classes", ["person"])
+        }
+        self.frame_stride = max(1, int(det_cfg.get("frame_stride", 1)))
+
+        # -- detector ----------------------------------------------------
+        self.detector = detector or ObjectDetector(
+            model_path=config.model_path(),
+            confidence=float(det_cfg.get("confidence", 0.35)),
+            iou=float(det_cfg.get("iou", 0.5)),
+            image_size=int(det_cfg.get("image_size", 640)),
+            device=str(det_cfg.get("device", "auto")),
+            class_filter=det_cfg.get("classes") or [],
+            tracker=str(config.get("tracking.tracker", "bytetrack")),
+            half=bool(det_cfg.get("half", False)),
+        )
+
+        # -- zones and lines ---------------------------------------------
+        profile_name = str(camera.get("zones_profile", "default"))
+        profile = config.zone_profile(profile_name)
+        self.profile_name = profile_name
+        self.zone_engine = ZoneEngine(
+            zones=profile["zones"],
+            vehicle_classes=self.vehicle_classes,
+        )
+        self.line_engine = LineCrossingEngine(lines=profile["lines"])
+
+        # -- tracking and behaviour --------------------------------------
+        self.tracks = TrackManager(
+            camera_id=self.camera_id,
+            max_age_frames=int(config.get("tracking.max_age_frames", 30)),
+            min_hits=int(config.get("tracking.min_hits", 3)),
+            max_trajectory_points=int(
+                config.get("tracking.max_trajectory_points", 240)),
+            direction_change_degrees=float(
+                config.get("behaviour.direction_change_degrees", 45.0)),
+        )
+        self.behaviour = BehaviourEngine(
+            loitering_seconds=float(config.get("behaviour.loitering_seconds", 12)),
+            loitering_radius=float(config.get("behaviour.loitering_radius", 0.06)),
+            high_speed_threshold=float(
+                (config.threat_rules.get("factors", {})
+                 .get("high_speed", {}) or {}).get("threshold", 0.35)),
+        )
+
+        # -- anomaly ------------------------------------------------------
+        anomaly_cfg = config.section("anomaly")
+        model_file = config.path("models_dir") / str(
+            anomaly_cfg.get("model_file", "behaviour_anomaly.joblib"))
+        self.anomaly = AnomalyEngine(
+            min_samples=int(anomaly_cfg.get("min_samples", 25)),
+            contamination=float(anomaly_cfg.get("contamination", 0.10)),
+            n_estimators=int(anomaly_cfg.get("n_estimators", 150)),
+            random_state=int(anomaly_cfg.get("random_state", 42)),
+            refit_every=int(anomaly_cfg.get("refit_every", 25)),
+            decision_threshold=float(anomaly_cfg.get("decision_threshold", 0.0)),
+            model_path=model_file,
+            enabled=bool(anomaly_cfg.get("enabled", True)),
+        )
+        self.anomaly.load()
+        self._warm_start_anomaly()
+
+        # -- threat, incidents, alerts, evidence --------------------------
+        self.threat = ThreatEngine(
+            rules=config.threat_rules,
+            night_start_hour=int(config.get("schedule.night_start_hour", 20)),
+            night_end_hour=int(config.get("schedule.night_end_hour", 6)),
+        )
+        self.incidents = IncidentManager(
+            db=database,
+            dedupe_seconds=float(config.get("incidents.dedupe_seconds", 20)),
+            escalate_existing=bool(config.get("incidents.escalate_existing", True)),
+        )
+        # Alerts are created here, not in the GUI, so a headless run produces
+        # exactly the same records as an interactive one.
+        self.desktop_channel = DesktopChannel()
+        self.alerts = AlertManager(
+            db=database,
+            toast_min_level=str(config.get("alerts.toast_min_level", "HIGH")),
+            feed_size=int(config.get("alerts.feed_size", 200)),
+            channels=[LogChannel(), self.desktop_channel],
+        )
+
+        ev_cfg = config.section("evidence")
+        self.evidence = EvidenceManager(
+            evidence_dir=config.path("evidence_dir"),
+            enabled=bool(ev_cfg.get("enabled", True)),
+            min_threat_level=str(ev_cfg.get("min_threat_level", "MEDIUM")),
+            save_full_frame=bool(ev_cfg.get("save_full_frame", True)),
+            save_crop=bool(ev_cfg.get("save_crop", True)),
+            crop_padding=float(ev_cfg.get("crop_padding", 0.25)),
+            jpeg_quality=int(ev_cfg.get("jpeg_quality", 90)),
+            cooldown_seconds=float(ev_cfg.get("cooldown_seconds", 10)),
+            retention_days=int(ev_cfg.get("retention_days", 30)),
+        )
+
+        # -- ANPR and watchlist -------------------------------------------
+        anpr_cfg = config.section("anpr")
+        self.anpr = AnprEngine(
+            enabled=bool(anpr_cfg.get("enabled", True)),
+            ocr_backend=str(anpr_cfg.get("ocr_backend", "auto")),
+            min_ocr_confidence=float(anpr_cfg.get("min_ocr_confidence", 0.45)),
+            min_vehicle_height=int(anpr_cfg.get("min_vehicle_height", 90)),
+            plate_regex=anpr_cfg.get("plate_regex"),
+            accept_unvalidated=bool(anpr_cfg.get("accept_unvalidated", True)),
+        )
+        self.anpr_cooldown = float(anpr_cfg.get("cooldown_seconds", 3.0))
+        self.anpr_max_attempts = int(anpr_cfg.get("max_attempts_per_track", 6))
+        self.watchlist = WatchlistMatcher()
+        self.refresh_watchlist()
+
+        # -- rendering ----------------------------------------------------
+        self.annotator = Annotator(
+            overlays=config.get("gui.overlays", {}),
+            vehicle_classes=self.vehicle_classes,
+        )
+
+        self.stats = PipelineStats()
+        self._last_ts: float = time.time()
+        self._detection_sample_every = 15   # persist 1 detection row in 15
+        self._anomaly_check_every = 20      # score live tracks every N frames
+        self._alert_tracks: set[int] = set()
+
+        #: Installed by the worker so alerts reach the GUI.
+        self.on_incident: Optional[Callable[[Incident], None]] = None
+        self.incidents.on_incident = self._handle_new_incident
+
+        logger.info(
+            "Pipeline ready for %s | model=%s | device=%s | zones=%d | lines=%d",
+            self.camera_id, self.detector.model_path.name,
+            self.detector.device, len(self.zone_engine), len(self.line_engine),
+        )
+
+    # ------------------------------------------------------------------
+    # Setup helpers
+    # ------------------------------------------------------------------
+
+    def _warm_start_anomaly(self) -> None:
+        """Seed the anomaly baseline from previous sessions in SQLite."""
+        if self.db is None or not self.anomaly.enabled or self.anomaly.is_fitted:
+            return
+        try:
+            rows = self.db.get_track_feature_rows(limit=2000)
+        except Exception as exc:
+            logger.debug("Could not read historical tracks: %s", exc)
+            return
+        if not rows:
+            return
+        added = self.anomaly.add_samples(
+            BehaviourEngine.features_from_row(dict(row)) for row in rows
+        )
+        if added >= self.anomaly.min_samples:
+            self.anomaly.fit()
+
+    def refresh_watchlist(self) -> None:
+        """Reload the watchlist after the operator edits it."""
+        if self.db is None:
+            return
+        try:
+            self.watchlist.refresh(
+                entries_from_rows(self.db.get_watchlist(active_only=True))
+            )
+        except Exception as exc:
+            logger.warning("Could not load watchlist: %s", exc)
+
+    def persist_zones(self) -> None:
+        """Record the active zone geometry alongside the session."""
+        if self.db is None:
+            return
+        try:
+            self.db.save_zones(
+                self.camera_id, self.profile_name, self.zone_engine.as_dicts()
+            )
+        except Exception as exc:
+            logger.warning("Could not persist zones: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def process(self, frame: np.ndarray, frame_index: int,
+                ts: float | None = None) -> FrameOutput:
+        """Run one frame through the whole chain."""
+        moment = ts if ts is not None else time.time()
+        self._last_ts = moment
+        self.stats.frames_read += 1
+        self.stats.note_frame(moment)
+
+        # Frame skipping. The skipped frame is still returned so the operator
+        # sees smooth video; it simply carries no new analysis.
+        if frame_index % self.frame_stride != 0:
+            return FrameOutput(
+                frame_index=frame_index, ts=moment,
+                annotated=self._render(frame, frame_index, moment)
+                if self.annotate else None,
+                raw=frame, tracks=list(self.tracks.tracks.values()),
+                skipped=True,
+            )
+
+        self.stats.frames_processed += 1
+        height, width = frame.shape[:2]
+
+        # -- detection + identity ----------------------------------------
+        detections = self.detector.track(frame)
+        self.stats.detections += len(detections)
+
+        observations = []
+        for det in detections:
+            if det.track_number is None:
+                continue
+            box_norm = det.normalised(width, height)
+            point = self.zone_engine.reference_point(box_norm, det.class_name)
+            observations.append(
+                (det.track_number, det.class_name, point, box_norm, det.confidence)
+            )
+
+        active, closed = self.tracks.update(observations, moment)
+
+        # -- zone, line, behaviour, threat -------------------------------
+        new_incidents: list[Incident] = []
+        self._alert_tracks.clear()
+
+        person_count = self.tracks.count_class(self.person_classes)
+        vehicle_count = self.tracks.count_class(self.vehicle_classes)
+
+        for track in active:
+            if track.frames_seen < self.tracks.min_hits:
+                continue
+            new_incidents.extend(
+                self._analyse_track(track, frame, moment, person_count)
+            )
+
+        # -- anomaly on live tracks --------------------------------------
+        if self.stats.frames_processed % self._anomaly_check_every == 0:
+            for track in active:
+                if track.frames_seen < max(self.tracks.min_hits, 10):
+                    continue
+                result = self.anomaly.score(self.behaviour.features(track, moment))
+                track.anomaly_status = result.status
+                track.anomaly_score = result.score
+                if result.status == STATUS_ANOMALOUS and not track.loitering:
+                    incident = self._raise_anomaly_incident(
+                        track, result, frame, moment
+                    )
+                    if incident is not None:
+                        new_incidents.append(incident)
+
+        # -- retire finished tracks --------------------------------------
+        for track in closed:
+            self._close_track(track, moment)
+
+        # -- ANPR ---------------------------------------------------------
+        if self.anpr.available:
+            for track in active:
+                incident = self._try_anpr(track, frame, moment)
+                if incident is not None:
+                    new_incidents.append(incident)
+
+        # -- sampled detection rows ---------------------------------------
+        self._persist_detection_sample(detections, frame_index, moment,
+                                       width, height)
+
+        self.stats.incidents += len(new_incidents)
+
+        annotated = (
+            self._render(frame, frame_index, moment, active)
+            if self.annotate else None
+        )
+
+        return FrameOutput(
+            frame_index=frame_index,
+            ts=moment,
+            annotated=annotated,
+            raw=frame,
+            tracks=active,
+            detections=detections,
+            incidents=new_incidents,
+            persons=person_count,
+            vehicles=vehicle_count,
+            inference_ms=self.detector.stats.last_inference_ms,
+        )
+
+    # ------------------------------------------------------------------
+    # Per-track analysis
+    # ------------------------------------------------------------------
+
+    def _analyse_track(
+        self,
+        track: TrackState,
+        frame: np.ndarray,
+        now: float,
+        person_count: int,
+    ) -> list[Incident]:
+        """Zone, line and loitering rules for one track."""
+        raised: list[Incident] = []
+        point = track.position
+        box_norm = track.box
+
+        # -- zone occupancy ------------------------------------------------
+        zone_events = self.zone_engine.update(
+            track_number=track.track_number,
+            class_name=track.class_name,
+            box_norm=box_norm,
+            ts=now,
+            confidence=track.avg_confidence,
+        )
+        for event in zone_events:
+            if event.kind == "exit":
+                was_alarming = event.zone.kind in ZoneKind.ALARMING
+                track.enter_zone(None, now, was_alarming, event.dwell_seconds)
+                continue
+
+            track.enter_zone(event.zone.name, now)
+            if not self.zone_engine.is_violation(event.zone, track.class_name):
+                continue
+
+            incident_type, ctx = self._zone_context(event.zone, track, now,
+                                                    person_count)
+            assessment = self.threat.assess(ctx)
+            outcome = self.incidents.submit(
+                camera_id=self.camera_id,
+                incident_type=incident_type,
+                assessment=assessment,
+                ts=now,
+                track_number=track.track_number,
+                track_db_id=track.db_id,
+                object_class=track.class_name,
+                zone_name=event.zone.name,
+                detail={
+                    "zone_kind": event.zone.kind,
+                    "entry_point": list(event.point),
+                    "confidence": round(track.avg_confidence, 3),
+                    "features": self.behaviour.describe_features(track, now),
+                },
+                session_id=self.session_id,
+            )
+            self._alert_tracks.add(track.track_number)
+            if outcome.created:
+                self._after_incident(outcome.incident, track, frame, now)
+                raised.append(outcome.incident)
+
+        # -- line crossing --------------------------------------------------
+        for crossing in self.line_engine.update(
+            track_number=track.track_number,
+            class_name=track.class_name,
+            point=point,
+            ts=now,
+            confidence=track.avg_confidence,
+        ):
+            track.line_crossings += 1
+            ctx = ThreatContext(
+                incident_type=IncidentType.LINE_CROSSING,
+                class_name=track.class_name,
+                crossed_line=True,
+                in_restricted_zone=self._in_kind(track, ZoneKind.RESTRICTED),
+                in_border_zone=self._in_kind(track, ZoneKind.BORDER),
+                anomaly_detected=track.anomaly_status == STATUS_ANOMALOUS,
+                anomaly_score=track.anomaly_score,
+                group_size=person_count,
+                speed=track.speed,
+                zone_name=track.zone_name,
+                ts=now,
+            )
+            assessment = self.threat.assess(ctx)
+            outcome = self.incidents.submit(
+                camera_id=self.camera_id,
+                incident_type=IncidentType.LINE_CROSSING,
+                assessment=assessment,
+                ts=now,
+                track_number=track.track_number,
+                track_db_id=track.db_id,
+                object_class=track.class_name,
+                zone_name=crossing.line.name,
+                detail=crossing.to_dict(),
+                session_id=self.session_id,
+            )
+            self._alert_tracks.add(track.track_number)
+            if outcome.created:
+                self._after_incident(outcome.incident, track, frame, now)
+                raised.append(outcome.incident)
+
+        # -- loitering -------------------------------------------------------
+        loiter = self.behaviour.check_loitering(track, now)
+        if loiter is not None:
+            ctx = ThreatContext(
+                incident_type=IncidentType.LOITERING,
+                class_name=track.class_name,
+                loitering=True,
+                loitering_seconds=loiter.duration_seconds,
+                in_restricted_zone=self._in_kind(track, ZoneKind.RESTRICTED),
+                in_border_zone=self._in_kind(track, ZoneKind.BORDER),
+                anomaly_detected=track.anomaly_status == STATUS_ANOMALOUS,
+                anomaly_score=track.anomaly_score,
+                group_size=person_count,
+                zone_name=track.zone_name,
+                ts=now,
+            )
+            assessment = self.threat.assess(ctx)
+            outcome = self.incidents.submit(
+                camera_id=self.camera_id,
+                incident_type=IncidentType.LOITERING,
+                assessment=assessment,
+                ts=now,
+                track_number=track.track_number,
+                track_db_id=track.db_id,
+                object_class=track.class_name,
+                zone_name=track.zone_name,
+                detail=loiter.to_dict(),
+                session_id=self.session_id,
+            )
+            self._alert_tracks.add(track.track_number)
+            if outcome.created:
+                self._after_incident(outcome.incident, track, frame, now)
+                raised.append(outcome.incident)
+
+        return raised
+
+    def _zone_context(
+        self, zone: Any, track: TrackState, now: float, person_count: int
+    ) -> tuple[str, ThreatContext]:
+        """Map a zone entry to an incident type and a threat context."""
+        is_vehicle = track.class_name.lower() in self.vehicle_classes
+
+        if zone.kind == ZoneKind.RESTRICTED:
+            incident_type = IncidentType.RESTRICTED_INTRUSION
+        elif zone.kind == ZoneKind.BORDER:
+            incident_type = IncidentType.BORDER_INTRUSION
+        else:
+            incident_type = IncidentType.NO_VEHICLE_VIOLATION
+
+        ctx = ThreatContext(
+            incident_type=incident_type,
+            class_name=track.class_name,
+            zone_kind=zone.kind,
+            zone_name=zone.name,
+            in_restricted_zone=zone.kind == ZoneKind.RESTRICTED,
+            in_border_zone=zone.kind == ZoneKind.BORDER,
+            vehicle_in_no_vehicle_zone=(
+                zone.kind == ZoneKind.NO_VEHICLE and is_vehicle),
+            unauthorised_vehicle=(
+                is_vehicle and zone.kind in ZoneKind.ALARMING),
+            loitering=track.loitering,
+            loitering_seconds=track.dwell_seconds(now),
+            anomaly_detected=track.anomaly_status == STATUS_ANOMALOUS,
+            anomaly_score=track.anomaly_score,
+            group_size=person_count,
+            speed=track.speed,
+            ts=now,
+        )
+        return incident_type, ctx
+
+    def _in_kind(self, track: TrackState, kind: str) -> bool:
+        if not track.zone_name:
+            return False
+        zone = self.zone_engine._zone_by_name(track.zone_name)
+        return zone is not None and zone.kind == kind
+
+    def _raise_anomaly_incident(
+        self, track: TrackState, result: Any, frame: np.ndarray, now: float
+    ) -> Optional[Incident]:
+        ctx = ThreatContext(
+            incident_type=IncidentType.ANOMALY,
+            class_name=track.class_name,
+            anomaly_detected=True,
+            anomaly_score=result.score,
+            in_restricted_zone=self._in_kind(track, ZoneKind.RESTRICTED),
+            in_border_zone=self._in_kind(track, ZoneKind.BORDER),
+            zone_name=track.zone_name,
+            speed=track.speed,
+            ts=now,
+        )
+        assessment = self.threat.assess(ctx)
+        outcome = self.incidents.submit(
+            camera_id=self.camera_id,
+            incident_type=IncidentType.ANOMALY,
+            assessment=assessment,
+            ts=now,
+            track_number=track.track_number,
+            track_db_id=track.db_id,
+            object_class=track.class_name,
+            zone_name=track.zone_name,
+            detail={
+                "anomaly": result.to_dict(),
+                "features": self.behaviour.describe_features(track, now),
+            },
+            session_id=self.session_id,
+        )
+        if outcome.created:
+            self._alert_tracks.add(track.track_number)
+            self._after_incident(outcome.incident, track, frame, now)
+            return outcome.incident
+        return None
+
+    # ------------------------------------------------------------------
+    # ANPR
+    # ------------------------------------------------------------------
+
+    def _try_anpr(
+        self, track: TrackState, frame: np.ndarray, now: float
+    ) -> Optional[Incident]:
+        """Attempt a plate read on a vehicle track, subject to cooldown."""
+        if track.class_name.lower() not in self.vehicle_classes:
+            return None
+        if track.plate_text:
+            return None
+        if track.plate_attempts >= self.anpr_max_attempts:
+            return None
+        if now - track.plate_last_attempt_ts < self.anpr_cooldown:
+            return None
+
+        track.plate_last_attempt_ts = now
+        track.plate_attempts += 1
+
+        height, width = frame.shape[:2]
+        box_norm = track.box
+        box_px = (box_norm[0] * width, box_norm[1] * height,
+                  box_norm[2] * width, box_norm[3] * height)
+
+        result = self.anpr.read_plate(frame, box_px)
+        crop = result.get("crop")
+        if crop is None:
+            return None
+
+        evidence_file = self.evidence.capture_plate(
+            crop, self.camera_id, track.track_number, now
+        )
+        evidence_path = str(evidence_file.path) if evidence_file else None
+        if evidence_file:
+            self.stats.evidence_files += 1
+
+        text = result.get("text")
+        match = self.watchlist.match(text) if text else None
+
+        plate = PlateRead(
+            camera_id=self.camera_id,
+            track_number=track.track_number,
+            text=text,
+            ocr_confidence=float(result.get("confidence", 0.0)),
+            backend=str(result.get("backend", "none")),
+            ts=now,
+            validated=bool(result.get("validated", False)),
+            evidence_path=evidence_path,
+            watchlist_hit=bool(match and match.exact),
+        )
+        if self.db is not None:
+            try:
+                self.db.insert_plate(plate)
+                if evidence_file:
+                    self.db.insert_evidence(
+                        incident_id=None, camera_id=self.camera_id,
+                        track_number=track.track_number, kind="plate",
+                        file_path=str(evidence_file.path),
+                        width=evidence_file.width, height=evidence_file.height,
+                        size_bytes=evidence_file.size_bytes, ts=now,
+                    )
+            except Exception as exc:
+                logger.error("Could not persist plate read: %s", exc)
+
+        if not text:
+            logger.debug("%s plate UNREADABLE (%s)", track.label,
+                         result.get("reason", ""))
+            return None
+
+        track.plate_text = text
+        self.stats.plates_read += 1
+        logger.info("%s plate read: %s (confidence %.2f, %s)",
+                    track.label, text, plate.ocr_confidence,
+                    "validated" if plate.validated else "unvalidated")
+
+        if match is None:
+            return None
+        if not match.exact:
+            logger.warning(match.describe())
+            return None
+
+        if self.db is not None:
+            try:
+                self.db.record_watchlist_hit(match.entry.value)
+            except Exception as exc:
+                logger.error("Could not record watchlist hit: %s", exc)
+
+        ctx = ThreatContext(
+            incident_type=IncidentType.WATCHLIST,
+            class_name=track.class_name,
+            watchlist_match=True,
+            watchlist_value=text,
+            in_restricted_zone=self._in_kind(track, ZoneKind.RESTRICTED),
+            in_border_zone=self._in_kind(track, ZoneKind.BORDER),
+            unauthorised_vehicle=True,
+            zone_name=track.zone_name,
+            ts=now,
+        )
+        assessment = self.threat.assess(ctx)
+        outcome = self.incidents.submit(
+            camera_id=self.camera_id,
+            incident_type=IncidentType.WATCHLIST,
+            assessment=assessment,
+            ts=now,
+            track_number=track.track_number,
+            track_db_id=track.db_id,
+            object_class=track.class_name,
+            zone_name=track.zone_name,
+            detail={
+                "plate": text,
+                "ocr_confidence": round(plate.ocr_confidence, 3),
+                "validated": plate.validated,
+                "watchlist_label": match.entry.label,
+                "evidence": evidence_path,
+            },
+            session_id=self.session_id,
+        )
+        if outcome.created:
+            self._alert_tracks.add(track.track_number)
+            self._after_incident(outcome.incident, track, frame, now)
+            return outcome.incident
+        return None
+
+    # ------------------------------------------------------------------
+    # Incident side effects
+    # ------------------------------------------------------------------
+
+    def _handle_new_incident(self, incident: Incident) -> None:
+        """Raise the alert for a newly opened incident, then notify listeners."""
+        alert = self.alerts.raise_for_incident(incident)
+        if alert is not None:
+            self.stats.alerts += 1
+        if self.on_incident is not None:
+            try:
+                self.on_incident(incident)
+            except Exception as exc:  # pragma: no cover
+                logger.error("Incident handler failed: %s", exc, exc_info=True)
+
+    def _after_incident(
+        self, incident: Incident, track: TrackState,
+        frame: np.ndarray, now: float,
+    ) -> None:
+        """Capture evidence for an incident that has just been opened."""
+        track_key = f"{self.camera_id}:{track.track_number}"
+        if not self.evidence.should_capture(incident.threat_level, track_key, now):
+            return
+
+        height, width = frame.shape[:2]
+        box_norm = track.box
+        box_px = (box_norm[0] * width, box_norm[1] * height,
+                  box_norm[2] * width, box_norm[3] * height)
+
+        annotated = self._render(frame, self.stats.frames_processed, now,
+                                 list(self.tracks.tracks.values()))
+        files = self.evidence.capture(
+            frame=frame,
+            camera_id=self.camera_id,
+            incident_id=incident.db_id,
+            track_number=track.track_number,
+            box=box_px,
+            annotated=annotated,
+            ts=now,
+        )
+        self.evidence.note_capture(track_key, now)
+        self.stats.evidence_files += len(files)
+
+        if self.db is not None:
+            for item in files:
+                try:
+                    self.db.insert_evidence(
+                        incident_id=incident.db_id,
+                        camera_id=self.camera_id,
+                        track_number=track.track_number,
+                        kind=item.kind,
+                        file_path=str(item.path),
+                        width=item.width, height=item.height,
+                        size_bytes=item.size_bytes, ts=item.ts,
+                    )
+                except Exception as exc:
+                    logger.error("Could not index evidence: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _close_track(self, track: TrackState, now: float) -> None:
+        """Retire a track: feed the anomaly baseline and persist it."""
+        features = self.behaviour.features(track, now)
+        self.anomaly.add_sample(features)
+
+        self.zone_engine.forget(track.track_number)
+        self.line_engine.forget(track.track_number)
+        self.incidents.forget_track(self.camera_id, track.track_number)
+
+        if self.db is None:
+            return
+        try:
+            record = self._to_record(track)
+            track_id = self.db.upsert_track(record)
+            self.db.close_track(track_id)
+        except Exception as exc:
+            logger.error("Could not persist track %s: %s", track.label, exc)
+
+    def _to_record(self, track: TrackState) -> TrackRecord:
+        return TrackRecord(
+            camera_id=self.camera_id,
+            track_number=track.track_number,
+            class_name=track.class_name,
+            first_ts=track.first_ts,
+            last_ts=track.last_ts,
+            frames_seen=track.frames_seen,
+            avg_confidence=track.avg_confidence,
+            max_confidence=track.max_confidence,
+            distance_norm=track.distance_norm,
+            avg_speed=track.avg_speed,
+            max_speed=track.max_speed,
+            direction_changes=track.direction_changes,
+            dwell_seconds=track.dwell_seconds(track.last_ts),
+            zone_transitions=track.zone_transitions,
+            zones_visited=list(track.zones_visited),
+            restricted_seconds=track.restricted_seconds,
+            anomaly_score=track.anomaly_score,
+            anomaly_status=track.anomaly_status,
+            trajectory=track.trajectory_rows(),
+            session_id=self.session_id,
+            db_id=track.db_id,
+        )
+
+    def _persist_detection_sample(
+        self, detections: list[Detection], frame_index: int,
+        ts: float, width: int, height: int,
+    ) -> None:
+        """Store a sample of detections, not every one.
+
+        Writing every box of every frame would put tens of thousands of rows
+        into SQLite for a two minute clip and tell you nothing the tracks do
+        not already say.
+        """
+        if self.db is None or not detections:
+            return
+        if frame_index % self._detection_sample_every != 0:
+            return
+        rows = []
+        for det in detections:
+            x1, y1, x2, y2 = det.normalised(width, height)
+            rows.append({
+                "session_id": self.session_id,
+                "camera_id": self.camera_id,
+                "track_id": None,
+                "frame_index": frame_index,
+                "ts": ts,
+                "class_name": det.class_name,
+                "confidence": det.confidence,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "zone_name": (self.zone_engine.current_zone(det.track_number)
+                              if det.track_number is not None else None),
+            })
+        try:
+            self.db.insert_detections(rows)
+        except Exception as exc:
+            logger.error("Could not persist detections: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Rendering and shutdown
+    # ------------------------------------------------------------------
+
+    def _render(
+        self, frame: np.ndarray, frame_index: int, ts: float,
+        tracks: Optional[list[TrackState]] = None,
+    ) -> np.ndarray:
+        live = tracks if tracks is not None else list(self.tracks.tracks.values())
+        hud = {
+            "camera_id": self.camera_id,
+            "timestamp": time.strftime("%H:%M:%S", time.localtime(ts)),
+            "frame_index": frame_index,
+            "fps": self.stats.fps,
+            "inference_ms": self.detector.stats.last_inference_ms,
+            "persons": self.tracks.count_class(self.person_classes),
+            "vehicles": self.tracks.count_class(self.vehicle_classes),
+            "tracks": self.tracks.live_count,
+            "incidents": self.stats.incidents,
+            "threat_level": self._current_threat_level(),
+        }
+        return self.annotator.render(
+            frame=frame,
+            tracks=live,
+            zones=self.zone_engine.zones,
+            lines=self.line_engine.lines,
+            hud=hud,
+            alert_tracks=set(self._alert_tracks),
+        )
+
+    def _current_threat_level(self) -> str:
+        if self.db is not None:
+            try:
+                return self.db.highest_open_threat()
+            except Exception:
+                pass
+        return ThreatLevel.LOW
+
+    def finalise(self) -> None:
+        """Close out a session: retire tracks, save the anomaly model."""
+        now = self._last_ts
+        for track in self.tracks.close_all():
+            self._close_track(track, now)
+        self.anomaly.save()
+        logger.info(
+            "Pipeline finished for %s | frames %d/%d | detections %d | "
+            "incidents %d | evidence %d | plates %d",
+            self.camera_id, self.stats.frames_processed, self.stats.frames_read,
+            self.stats.detections, self.stats.incidents,
+            self.stats.evidence_files, self.stats.plates_read,
+        )
+
+    def describe(self) -> dict[str, Any]:
+        """Everything the Settings and Dashboard screens want to display."""
+        return {
+            "camera_id": self.camera_id,
+            "detector": self.detector.describe(),
+            "zones": len(self.zone_engine),
+            "lines": len(self.line_engine),
+            "zone_profile": self.profile_name,
+            "anomaly": self.anomaly.status_text(),
+            "anpr": self.anpr.status_text(),
+            "watchlist_entries": len(self.watchlist),
+            "threat_rules": len(self.threat.factors),
+        }

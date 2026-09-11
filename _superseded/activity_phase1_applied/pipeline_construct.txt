@@ -1,0 +1,33 @@
+        self.pose = PoseEstimator.from_config(config)
+
+        # -- person activity analysis --------------------------------------
+        # Four separate stages, in order, each doing one job:
+        #   pose        -> where this person's joints are, this frame
+        #   history     -> where they have been, keyed by Track ID
+        #   movement    -> measurable signals derived from that history
+        #   classifier  -> a named behaviour, debounced over time
+        # Nothing here knows a camera id exists. What differs between cameras
+        # is only what their lenses can see.
+        self.activity_enabled = bool(config.get("activity.enabled", True))
+        self.pose_history = PoseHistory(
+            window_seconds=float(
+                config.get("activity.history.window_seconds", 3.0)),
+            max_samples=int(config.get("activity.history.max_samples", 90)),
+        )
+        self.movement = MovementAnalyzer(
+            min_samples=int(config.get("activity.movement.min_samples", 4)),
+            min_duration=float(
+                config.get("activity.movement.min_duration", 0.25)),
+            window_seconds=float(
+                config.get("activity.movement.window_seconds", 1.0)),
+            stationary_speed=float(
+                config.get("activity.movement.stationary_speed", 0.15)),
+            min_support=int(config.get("activity.movement.min_support", 6)),
+        )
+        behaviour_cfg = config.section("activity").get("behaviour", {}) or {}
+        self.behaviour_classifier = BehaviourClassifier(
+            **{k: float(v) for k, v in behaviour_cfg.items()}
+        )
+        #: Behaviour changes raised this frame, for the GUI and the API.
+        self.behaviour_events: list = []
+

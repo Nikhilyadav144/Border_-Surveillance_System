@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime output. The folders are kept (see the .gitkeep files); what the
+# application writes into them is not.
+data/database/*.db
+data/database/*.db-wal
+data/database/*.db-shm
+data/evidence/*
+!data/evidence/.gitkeep
+data/output/*
+!data/output/.gitkeep
+logs/*.log
+logs/*.log.*
+
+# Test footage. Videos are large and usually licensed; keep them out of the
+# repository and follow docs/DATA.md instead.
+data/input/*
+!data/input/.gitkeep
+!data/input/README.txt
+
+# Learned models. Weights that ship with the project are committed; the
+# behavioural baseline is learned per deployment and should not be.
+models/behaviour_anomaly.joblib
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,57 @@
+    # ------------------------------------------------------------------
+    # Person activity, read by the API stats and the GUI
+    # ------------------------------------------------------------------
+
+    @property
+    def activity_state(self) -> dict[str, Any]:
+        """What the people on screen are currently doing.
+
+        Counts come from the classifier's own debounced states, so what the
+        dashboard shows is the same thing that would raise an event, never a
+        separate reading that could disagree with it.
+        """
+        summary = self.behaviour_classifier.summary()
+        posed = sum(1 for t in self.tracks.tracks.values()
+                    if t.pose_status == POSE_TRACKED)
+        if not self.activity_enabled:
+            text = "Disabled in config"
+        elif not summary:
+            text = "No people tracked"
+        else:
+            text = ", ".join(f"{count} {name.lower()}"
+                             for name, count in sorted(summary.items()))
+        return {
+            "enabled": self.activity_enabled,
+            "summary": text,
+            "behaviours": summary,
+            "tracked_poses": posed,
+            "histories": len(self.pose_history),
+        }
+
+    def people(self) -> list[dict[str, Any]]:
+        """One row per tracked person, for the operator's table.
+
+        Only fields the backend actually has. A person whose box was too
+        small for pose reports UNAVAILABLE and UNKNOWN rather than a
+        plausible-looking default.
+        """
+        rows = []
+        for track in self.tracks.confirmed():
+            if track.class_name.lower() not in self.person_classes:
+                continue
+            rows.append({
+                "track_id": track.track_number,
+                "label": track.label,
+                "position": [round(v, 4) for v in track.position],
+                "behaviour": track.behaviour,
+                "confidence": round(float(track.behaviour_confidence), 2),
+                "duration": round(float(track.behaviour_duration), 2),
+                "direction": track.movement_direction,
+                "pose_status": track.pose_status,
+                "keypoints": (track.pose.visible_count
+                              if track.pose is not None else 0),
+                "posture": (track.posture.label
+                            if track.posture is not None else None),
+            })
+        return rows
+

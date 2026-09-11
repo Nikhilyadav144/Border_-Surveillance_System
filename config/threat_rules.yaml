@@ -1,0 +1,119 @@
+# ==========================================================================
+# Threat scoring rules
+# --------------------------------------------------------------------------
+# IMPORTANT: this is a CONFIGURABLE PROTOTYPE RISK MODEL.
+#
+# The numbers below are engineering defaults chosen to make the demo
+# behave sensibly. They are NOT derived from any military, police or
+# international security standard, and they have not been validated against
+# real incident data. Treat the output as a ranked triage hint for a human
+# operator, never as an authoritative threat assessment.
+# ==========================================================================
+
+# Every factor adds its weight to a 0-100 score. The score is clamped at 100.
+# Set a weight to 0 to switch a factor off without deleting it.
+factors:
+  restricted_zone_intrusion:
+    weight: 30
+    label: "Restricted zone intrusion"
+
+  border_zone_intrusion:
+    weight: 25
+    label: "Border zone entry"
+
+  no_vehicle_zone_violation:
+    weight: 20
+    label: "Vehicle in a no-vehicle zone"
+
+  line_crossing:
+    weight: 20
+    label: "Virtual boundary crossed"
+
+  # Two boundary factors, deliberately separate, because they are two
+  # different claims about the same moment.
+  #
+  # `line_crossing` above fires when the tracker's reference point crossed a
+  # configured line segment between two frames. That is geometry, and a box
+  # that grows or jitters can produce it.
+  #
+  # `boundary_crossed` fires only when core/boundary_interaction.py has the
+  # evidence chain behind it: the person was already engaged with THAT
+  # boundary, and was afterwards observed on the opposite side. On CAM-01
+  # that is the difference between a wobbling box and a man going over a
+  # fence, and it is why the vault ends up HIGH while a bare intersection
+  # on its own stays LOW.
+  boundary_crossed:
+    weight: 40
+    label: "Security boundary crossed"
+
+  # Climbing, vaulting or reaching for the boundary without having crossed
+  # it yet. Worth flagging while it is still preventable.
+  boundary_interacting:
+    weight: 25
+    label: "Physically engaging with the security boundary"
+
+  # CONTEXT, not an incident. Travelling with the torso folded well off
+  # vertical is how a person moves when they would rather not be seen over a
+  # barrier, and on CAM-01 one person covered the fence line at 3.0 body
+  # heights per second with his torso 75 degrees over.
+  #
+  # It is weighted low and has no entry in minimum_levels, so it can never
+  # raise an incident on its own. Somebody jogging bent into the wind, or
+  # carrying something heavy, looks the same to a camera. What it does is
+  # lift the score of an event that is already happening.
+  low_profile_movement:
+    weight: 15
+    label: "Moving while bent over"
+
+  loitering:
+    weight: 20
+    label: "Loitering"
+
+  # Extra points for every full minute of loitering beyond the threshold,
+  # capped by loitering_duration_max.
+  loitering_duration_per_minute: 5
+  loitering_duration_max: 15
+
+  behavioural_anomaly:
+    weight: 15
+    label: "Behavioural anomaly"
+
+  unauthorised_vehicle:
+    weight: 20
+    label: "Unauthorised vehicle in a restricted area"
+
+  watchlist_match:
+    weight: 30
+    label: "Watchlist match"
+
+  # Fires on MEASURED scene darkness, not on the hour of day. See the
+  # low_light section of application.yaml for the thresholds. The key is
+  # still night_time so existing rule files keep working.
+  night_time:
+    weight: 10
+    label: "Low-light conditions"
+
+  group_presence:
+    weight: 10
+    label: "Group of three or more people"
+    # Number of tracked people in frame that counts as a group.
+    min_group_size: 3
+
+  high_speed:
+    weight: 10
+    label: "Unusually fast movement"
+    # Speed in fraction-of-frame-diagonal per second.
+    threshold: 0.35
+
+# Score to level mapping. Ranges are inclusive of the lower bound.
+levels:
+  LOW:      0
+  MEDIUM:   25
+  HIGH:     50
+  CRITICAL: 75
+
+# Incident types that are always at least this level, whatever the score.
+# Useful when an event must never be buried, e.g. a watchlist hit.
+minimum_levels:
+  watchlist_match: "HIGH"
+  restricted_zone_intrusion: "MEDIUM"

@@ -1,0 +1,453 @@
+"""Cameras: the live monitoring screen.
+
+Left column lists the configured cameras and their health. Right column is the
+camera view with the processing controls and the live track table.
+
+This page never processes anything itself. It asks the main window to start or
+stop a :class:`PipelineWorker` and then renders whatever the worker emits.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.gui.pages.base import Page
+from app.gui.theme import Palette, mono_font, ui_font
+from app.gui.widgets.common import Badge, Card, StatRow, StatusDot
+from app.gui.widgets.video_view import VideoView
+from inputs.factory import describe_source
+
+
+class CamerasPage(Page):
+    """Live camera monitoring and control."""
+
+    start_requested = Signal(dict)
+    stop_requested = Signal()
+    pause_requested = Signal()
+    resume_requested = Signal()
+
+    title = "Cameras"
+    subtitle = "Live monitoring, video processing and camera health"
+
+    def build(self) -> None:
+        splitter = QSplitter(Qt.Horizontal)
+
+        splitter.addWidget(self._build_left())
+        splitter.addWidget(self._build_right())
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([310, 1100])
+
+        self.content.addWidget(splitter, 1)
+
+        self._selected_camera: Optional[dict] = None
+        self._running = False
+        self._populate_cameras()
+
+    # ------------------------------------------------------------------
+    # Left column
+    # ------------------------------------------------------------------
+
+    def _build_left(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 6, 0)
+        layout.setSpacing(10)
+
+        list_card = Card("Configured Cameras")
+        self.camera_list = QListWidget()
+        self.camera_list.setMinimumHeight(200)
+        self.camera_list.setTextElideMode(Qt.ElideRight)
+        self.camera_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.camera_list.currentItemChanged.connect(self._on_camera_selected)
+        list_card.add(self.camera_list, 1)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        self.btn_open_file = QPushButton("Open Video…")
+        self.btn_open_file.setToolTip(
+            "Pick any video file on this computer and run it through the "
+            "pipeline as an ad-hoc camera."
+        )
+        self.btn_open_file.clicked.connect(self._open_video_file)
+        self.btn_reload = QPushButton("Reload")
+        self.btn_reload.setToolTip("Re-read config/cameras.yaml")
+        self.btn_reload.clicked.connect(self._populate_cameras)
+        buttons.addWidget(self.btn_open_file, 1)
+        buttons.addWidget(self.btn_reload)
+        list_card.add_layout(buttons)
+        layout.addWidget(list_card, 1)
+
+        detail_card = Card("Camera Detail")
+        self.row_id = StatRow("ID", "-")
+        self.row_name = StatRow("Name", "-")
+        self.row_location = StatRow("Location", "-")
+        self.row_type = StatRow("Source type", "-")
+        self.row_source = StatRow("Source", "-")
+        self.row_profile = StatRow("Zone profile", "-")
+        self.row_status = StatRow("Status", "OFFLINE", Palette.OFFLINE)
+        self.row_fps = StatRow("FPS", "0.0")
+        self.row_latency = StatRow("Inference", "0 ms")
+        self.row_last = StatRow("Last frame", "-")
+        for row in (self.row_id, self.row_name, self.row_location,
+                    self.row_type, self.row_source, self.row_profile,
+                    self.row_status, self.row_fps, self.row_latency,
+                    self.row_last):
+            detail_card.add(row)
+        layout.addWidget(detail_card)
+
+        return panel
+
+    # ------------------------------------------------------------------
+    # Right column
+    # ------------------------------------------------------------------
+
+    def _build_right(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(6, 0, 0, 0)
+        layout.setSpacing(10)
+
+        # Control bar
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+
+        self.btn_start = QPushButton("▶  Start Processing")
+        self.btn_start.setObjectName("Primary")
+        self.btn_start.clicked.connect(self._on_start)
+        self.btn_pause = QPushButton("⏸  Pause")
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.clicked.connect(self._on_pause)
+        self.btn_stop = QPushButton("⏹  Stop")
+        self.btn_stop.setObjectName("Danger")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._on_stop)
+
+        self.status_dot = StatusDot(Palette.OFFLINE, 10)
+        self.status_text = QLabel("IDLE")
+        self.status_text.setFont(ui_font(10, bold=True, spacing=1.0))
+        self.status_text.setStyleSheet(f"color: {Palette.TEXT_DIM};")
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedWidth(190)
+
+        controls.addWidget(self.btn_start)
+        controls.addWidget(self.btn_pause)
+        controls.addWidget(self.btn_stop)
+        controls.addSpacing(14)
+        controls.addWidget(self.status_dot)
+        controls.addWidget(self.status_text)
+        controls.addStretch(1)
+        controls.addWidget(QLabel("Progress"))
+        controls.addWidget(self.progress)
+        layout.addLayout(controls)
+
+        # Video
+        self.video = VideoView()
+        layout.addWidget(self.video, 5)
+
+        # Live statistics strip
+        stats = QHBoxLayout()
+        stats.setSpacing(10)
+        self.stat_widgets: dict[str, QLabel] = {}
+        for key, label in (
+            ("frame", "FRAME"), ("fps", "FPS"), ("inference", "INFERENCE"),
+            ("persons", "PERSONS"), ("vehicles", "VEHICLES"),
+            ("tracks", "LIVE TRACKS"), ("incidents", "INCIDENTS"),
+            ("evidence", "EVIDENCE"),
+        ):
+            card = Card(flat=True)
+            card.body().setContentsMargins(11, 7, 11, 7)
+            card.body().setSpacing(1)
+            caption = QLabel(label)
+            caption.setObjectName("KpiLabel")
+            value = QLabel("0")
+            value.setFont(mono_font(14, bold=True))
+            card.add(caption)
+            card.add(value)
+            self.stat_widgets[key] = value
+            stats.addWidget(card)
+        layout.addLayout(stats)
+
+        # Track table
+        tracks_card = Card("Live Tracks")
+        self.track_table = QTableWidget(0, 9)
+        self.track_table.setHorizontalHeaderLabels(
+            ["OBJECT", "CONF", "ZONE", "DWELL", "SPEED", "HEADING",
+             "TURNS", "BEHAVIOUR", "PLATE"]
+        )
+        self.track_table.verticalHeader().setVisible(False)
+        self.track_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.track_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.track_table.setAlternatingRowColors(True)
+        self.track_table.setMinimumHeight(150)
+        header = self.track_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.Stretch)
+        tracks_card.add(self.track_table, 1)
+        layout.addWidget(tracks_card, 2)
+
+        return panel
+
+    # ------------------------------------------------------------------
+    # Camera list
+    # ------------------------------------------------------------------
+
+    def _populate_cameras(self) -> None:
+        self.camera_list.clear()
+        cameras = self.ctx.config.cameras
+
+        if not cameras:
+            item = QListWidgetItem("No cameras configured")
+            item.setForeground(Palette.qcolor(Palette.TEXT_DIM))
+            item.setFlags(Qt.NoItemFlags)
+            self.camera_list.addItem(item)
+            return
+
+        db_status = {}
+        if self.ctx.db is not None:
+            db_status = {c["id"]: c["status"] for c in self.ctx.db.get_cameras()}
+
+        for camera in cameras:
+            camera_id = str(camera.get("id"))
+            enabled = bool(camera.get("enabled", True))
+            status = db_status.get(camera_id,
+                                   "CONFIGURED" if not enabled else "OFFLINE")
+            marker = {"ONLINE": "●", "ERROR": "▲"}.get(status, "○")
+            item = QListWidgetItem(
+                f"{marker}  {camera_id}   {camera.get('name', '')}"
+            )
+            item.setData(Qt.UserRole, camera)
+            item.setForeground(Palette.qcolor(Palette.status(status)))
+            if not enabled:
+                item.setToolTip(
+                    "Disabled in cameras.yaml. Set enabled: true to use it."
+                )
+            self.camera_list.addItem(item)
+
+        if self.camera_list.count():
+            self.camera_list.setCurrentRow(0)
+
+    def _on_camera_selected(self, current: QListWidgetItem, _previous) -> None:
+        if current is None:
+            return
+        camera = current.data(Qt.UserRole)
+        if not camera:
+            return
+        self._selected_camera = camera
+        source = camera.get("source", {})
+
+        self.row_id.set_value(camera.get("id", "-"))
+        self.row_name.set_value(camera.get("name", "-"))
+        self.row_location.set_value(camera.get("location", "-"))
+        self.row_type.set_value(str(source.get("type", "-")).upper())
+        self.row_source.set_value(describe_source(camera)[-34:])
+        self.row_profile.set_value(camera.get("zones_profile", "default"))
+        self._refresh_health_rows()
+
+    def _refresh_health_rows(self) -> None:
+        if not self._selected_camera or self.ctx.db is None:
+            return
+        row = self.ctx.db.get_camera(str(self._selected_camera.get("id")))
+        if row is None:
+            self.row_status.set_value("NOT STARTED", Palette.TEXT_DIM)
+            return
+        status = str(row["status"])
+        self.row_status.set_value(status, Palette.status(status))
+        self.row_fps.set_value(f"{float(row['fps'] or 0):.1f}")
+        self.row_latency.set_value(f"{float(row['latency_ms'] or 0):.0f} ms")
+        self.row_last.set_value(
+            time.strftime("%H:%M:%S", time.localtime(float(row["last_frame_ts"])))
+            if row["last_frame_ts"] else "-"
+        )
+
+    # ------------------------------------------------------------------
+    # Controls
+    # ------------------------------------------------------------------
+
+    def _open_video_file(self) -> None:
+        start_dir = str(self.ctx.config.path("input_dir"))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select a video file", start_dir,
+            "Video files (*.mp4 *.avi *.mov *.mkv *.m4v *.webm);;All files (*)",
+        )
+        if not path:
+            return
+
+        camera = {
+            "id": "CAM-FILE",
+            "name": f"Ad-hoc: {path.rsplit('/', 1)[-1]}",
+            "location": "Operator selection",
+            "enabled": True,
+            "zones_profile": self._current_profile(),
+            "source": {"type": "video", "path": path,
+                       "loop": False, "target_fps": 25},
+        }
+        item = QListWidgetItem(f"○  CAM-FILE   {camera['name']}")
+        item.setData(Qt.UserRole, camera)
+        self.camera_list.addItem(item)
+        self.camera_list.setCurrentItem(item)
+
+    def _current_profile(self) -> str:
+        if self._selected_camera:
+            return str(self._selected_camera.get("zones_profile", "default"))
+        return "default"
+
+    def _on_start(self) -> None:
+        if self._selected_camera is None:
+            QMessageBox.information(
+                self, "No camera selected",
+                "Choose a camera from the list, or use 'Open Video…' to pick "
+                "a file from this computer.",
+            )
+            return
+        self.start_requested.emit(dict(self._selected_camera))
+
+    def _on_pause(self) -> None:
+        if self.btn_pause.text().startswith("⏸"):
+            self.pause_requested.emit()
+            self.btn_pause.setText("▶  Resume")
+        else:
+            self.resume_requested.emit()
+            self.btn_pause.setText("⏸  Pause")
+
+    def _on_stop(self) -> None:
+        self.stop_requested.emit()
+
+    # ------------------------------------------------------------------
+    # Worker signal handlers
+    # ------------------------------------------------------------------
+
+    def on_started(self, camera_id: str) -> None:
+        self._running = True
+        self.btn_start.setEnabled(False)
+        self.btn_pause.setEnabled(True)
+        self.btn_pause.setText("⏸  Pause")
+        self.btn_stop.setEnabled(True)
+        self.btn_open_file.setEnabled(False)
+        self.set_status("CONNECTING", Palette.WARNING)
+        self.video.clear_frame("CONNECTING", f"Opening {camera_id}")
+        self.progress.setValue(0)
+
+    def on_stopped(self) -> None:
+        self._running = False
+        self.btn_start.setEnabled(True)
+        self.btn_pause.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+        self.btn_open_file.setEnabled(True)
+        self.set_status("IDLE", Palette.TEXT_DIM)
+        self.video.clear_frame("PROCESSING COMPLETE",
+                               "Press Start to run again")
+        self._refresh_health_rows()
+
+    def set_status(self, text: str, colour: str) -> None:
+        self.status_text.setText(text)
+        self.status_text.setStyleSheet(f"color: {colour};")
+        self.status_dot.set_colour(colour)
+
+    def on_status(self, _camera_id: str, status: str) -> None:
+        self.set_status(status, Palette.status(status))
+
+    def on_frame(self, frame, stats: dict) -> None:
+        self.video.show_frame(frame)
+        self.stat_widgets["frame"].setText(str(stats.get("frame_index", 0)))
+        self.stat_widgets["fps"].setText(f"{stats.get('fps', 0):.1f}")
+        self.stat_widgets["inference"].setText(
+            f"{stats.get('inference_ms', 0):.0f}ms")
+        self.stat_widgets["persons"].setText(str(stats.get("persons", 0)))
+        self.stat_widgets["vehicles"].setText(str(stats.get("vehicles", 0)))
+        self.stat_widgets["tracks"].setText(str(stats.get("tracks", 0)))
+        self.stat_widgets["incidents"].setText(str(stats.get("incidents", 0)))
+        self.stat_widgets["evidence"].setText(str(stats.get("evidence", 0)))
+        rows = stats.get("track_rows")
+        if rows is not None:
+            self._update_tracks(rows)
+
+    def on_progress(self, value: int) -> None:
+        if value < 0:
+            self.progress.setRange(0, 0)      # live source: indeterminate
+        else:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(value)
+
+    def on_health(self, health) -> None:
+        if (self._selected_camera
+                and str(self._selected_camera.get("id")) == health.camera_id):
+            self.row_status.set_value(health.status,
+                                      Palette.status(health.status))
+            self.row_fps.set_value(f"{health.fps:.1f}")
+            self.row_latency.set_value(f"{health.latency_ms:.0f} ms")
+            if health.last_frame_ts:
+                self.row_last.set_value(
+                    time.strftime("%H:%M:%S",
+                                  time.localtime(health.last_frame_ts))
+                )
+
+    # ------------------------------------------------------------------
+
+    def _update_tracks(self, rows: list[dict]) -> None:
+        table = self.track_table
+        table.setRowCount(len(rows))
+
+        for index, row in enumerate(rows):
+            behaviour = []
+            if row.get("loitering"):
+                behaviour.append("LOITERING")
+            status = row.get("anomaly", "")
+            if status == "ANOMALOUS":
+                behaviour.append("ANOMALOUS")
+            elif status == "INSUFFICIENT_DATA":
+                behaviour.append("learning baseline")
+            elif status == "NORMAL":
+                behaviour.append("normal")
+            behaviour_text = ", ".join(behaviour) or "-"
+
+            values = [
+                row.get("label", "-"),
+                f"{row.get('confidence', 0):.2f}",
+                row.get("zone", "-"),
+                f"{row.get('dwell', 0):.0f}s",
+                f"{row.get('speed', 0):.3f}",
+                row.get("direction", "-"),
+                str(row.get("direction_changes", 0)),
+                behaviour_text,
+                row.get("plate", "-"),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column in (1, 3, 4, 6):
+                    item.setFont(mono_font(10))
+                if column == 7 and "LOITERING" in behaviour_text:
+                    item.setForeground(Palette.qcolor(Palette.HIGH))
+                elif column == 7 and "ANOMALOUS" in behaviour_text:
+                    item.setForeground(Palette.qcolor(Palette.CRITICAL))
+                elif column == 7:
+                    item.setForeground(Palette.qcolor(Palette.TEXT_DIM))
+                table.setItem(index, column, item)
+
+    def refresh(self) -> None:
+        if not self._running:
+            self._refresh_health_rows()

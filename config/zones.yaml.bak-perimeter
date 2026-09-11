@@ -1,0 +1,110 @@
+# ==========================================================================
+# Zone and virtual line definitions
+# --------------------------------------------------------------------------
+# All coordinates are NORMALISED to the range 0.0 - 1.0.
+#   x = 0.0 is the left edge,  x = 1.0 is the right edge
+#   y = 0.0 is the TOP edge,   y = 1.0 is the bottom edge
+#
+# Normalised coordinates mean a profile works at any resolution and survives
+# a change of camera without being redrawn in pixels.
+#
+# A zone is a closed polygon: list its vertices in order. Three or more
+# points are required. Any shape is allowed, not just rectangles.
+#
+# Zone kinds and what they mean to the threat engine:
+#   RESTRICTED   any object inside is an intrusion
+#   BORDER       the line-of-control strip, entry is an intrusion
+#   NO_VEHICLE   only vehicles inside are a violation
+#   PATROL       friendly area, presence is logged but not scored
+#   OBSERVATION  general monitoring, presence is logged but not scored
+# ==========================================================================
+
+profiles:
+
+  # ------------------------------------------------------------------
+  # The profile every camera uses unless it names another one.
+  # It models a camera looking towards a border that runs along the
+  # TOP of the frame.
+  # ------------------------------------------------------------------
+  default:
+    zones:
+      - name: "Border Strip"
+        kind: "BORDER"
+        colour: "#e5484d"
+        polygon:
+          - [0.00, 0.00]
+          - [1.00, 0.00]
+          - [1.00, 0.18]
+          - [0.00, 0.18]
+
+      - name: "Restricted Compound"
+        kind: "RESTRICTED"
+        colour: "#f76808"
+        polygon:
+          - [0.34, 0.30]
+          - [0.78, 0.30]
+          - [0.86, 0.72]
+          - [0.26, 0.72]
+
+      - name: "Vehicle Exclusion Area"
+        kind: "NO_VEHICLE"
+        colour: "#ffb224"
+        polygon:
+          - [0.02, 0.55]
+          - [0.24, 0.55]
+          - [0.24, 0.96]
+          - [0.02, 0.96]
+
+      - name: "Observation Area"
+        kind: "OBSERVATION"
+        colour: "#3e9b4f"
+        polygon:
+          - [0.00, 0.72]
+          - [1.00, 0.72]
+          - [1.00, 1.00]
+          - [0.00, 1.00]
+
+    lines:
+      - name: "Forward Boundary"
+        # A line is two points. `positive_direction` names the side that
+        # counts as "entering" for reporting purposes.
+        start: [0.00, 0.26]
+        end:   [1.00, 0.26]
+        colour: "#00b4d8"
+        # Which way is "in". Options: north, south, east, west.
+        # For a horizontal line, crossing upward (decreasing y) is north.
+        entering_direction: "north"
+
+      - name: "Eastern Checkpoint"
+        start: [0.72, 0.28]
+        end:   [0.72, 1.00]
+        colour: "#7c5cff"
+        entering_direction: "east"
+
+  # ------------------------------------------------------------------
+  # A minimal profile. Useful when testing with arbitrary footage where
+  # the default polygons make no sense.
+  # ------------------------------------------------------------------
+  simple_centre:
+    zones:
+      - name: "Central Restricted Area"
+        kind: "RESTRICTED"
+        colour: "#e5484d"
+        polygon:
+          - [0.30, 0.30]
+          - [0.70, 0.30]
+          - [0.70, 0.75]
+          - [0.30, 0.75]
+    lines:
+      - name: "Mid Line"
+        start: [0.00, 0.50]
+        end:   [1.00, 0.50]
+        colour: "#00b4d8"
+        entering_direction: "north"
+
+  # ------------------------------------------------------------------
+  # Empty profile: detection and tracking only, no zone or line events.
+  # ------------------------------------------------------------------
+  none:
+    zones: []
+    lines: []

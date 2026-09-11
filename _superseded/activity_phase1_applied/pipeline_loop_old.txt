@@ -1,0 +1,8 @@
+        for track in people:
+            result = results.get(track.track_number)
+            if result is None:
+                continue
+            track.pose = result
+            track.posture = estimate_posture(result)
+            track.pose_ts = moment
+            track.pose_count += 1

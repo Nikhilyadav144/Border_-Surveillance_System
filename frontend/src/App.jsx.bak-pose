@@ -1,0 +1,2379 @@
+import { useEffect, useMemo, useState } from "react";
+import "./App.css";
+
+const API = "http://127.0.0.1:8000";
+
+const EMPTY_STATS = {
+  persons: 0,
+  vehicles: 0,
+  tracks: 0,
+  detections: 0,
+  incidents: 0,
+  alerts: 0,
+  evidence: 0,
+  plates: 0,
+  fps: 0,
+  inference_ms: 0,
+  anomaly: "READY",
+  anpr: "READY",
+  error: null,
+  status: "OFFLINE",
+};
+
+function App() {
+  const [activeTab, setActiveTab] = useState("Dashboard");
+
+  const [cameras, setCameras] = useState([]);
+  const [selectedCamera, setSelectedCamera] = useState(null);
+
+  const [systemStatus, setSystemStatus] = useState(null);
+
+  const [loadingCamera, setLoadingCamera] = useState(null);
+
+  const [apiError, setApiError] = useState("");
+
+  const selected = useMemo(
+    () =>
+      cameras.find(
+        (camera) => camera.id === selectedCamera
+      ),
+    [cameras, selectedCamera]
+  );
+
+  // ============================================================
+  // LOAD CAMERAS + LIVE STATS
+  // ============================================================
+
+  const fetchCameras = async () => {
+    try {
+      const response = await fetch(
+        `${API}/api/cameras`
+      );
+
+      if (!response.ok) {
+        throw new Error("Unable to load cameras");
+      }
+
+      const cameraList = await response.json();
+
+      if (!Array.isArray(cameraList)) {
+        throw new Error("Invalid camera response");
+      }
+
+      const updatedCameras = await Promise.all(
+        cameraList.map(async (camera) => {
+          try {
+            const statsResponse = await fetch(
+              `${API}/api/cameras/${camera.id}/stats`
+            );
+
+            if (!statsResponse.ok) {
+              return {
+                ...camera,
+                running:
+                  camera.status === "ONLINE",
+                starting:
+                  camera.status === "STARTING" ||
+                  camera.status === "CONNECTING",
+                stats: EMPTY_STATS,
+              };
+            }
+
+            const stats =
+              await statsResponse.json();
+
+            return {
+              ...camera,
+
+              running:
+                stats.status === "ONLINE",
+
+              starting:
+                stats.status === "STARTING" ||
+                stats.status === "CONNECTING",
+
+              stats,
+            };
+          } catch {
+            return {
+              ...camera,
+
+              running:
+                camera.status === "ONLINE",
+
+              starting:
+                camera.status === "STARTING" ||
+                camera.status === "CONNECTING",
+
+              stats: EMPTY_STATS,
+            };
+          }
+        })
+      );
+
+      setCameras(updatedCameras);
+
+      setApiError("");
+
+      // Automatically select first camera
+      setSelectedCamera((current) => {
+        if (
+          current &&
+          updatedCameras.some(
+            (camera) => camera.id === current
+          )
+        ) {
+          return current;
+        }
+
+        return updatedCameras.length > 0
+          ? updatedCameras[0].id
+          : null;
+      });
+    } catch (error) {
+      console.error(
+        "Camera loading error:",
+        error
+      );
+
+      setApiError(
+        "Cannot connect to Python backend. Make sure FastAPI is running."
+      );
+    }
+  };
+
+  // ============================================================
+  // SYSTEM HEALTH
+  // ============================================================
+
+  const fetchSystemStatus = async () => {
+    try {
+      const response = await fetch(
+        `${API}/api/health`
+      );
+
+      if (!response.ok) {
+        return;
+      }
+
+      const data = await response.json();
+
+      setSystemStatus(data);
+    } catch {
+      setSystemStatus(null);
+    }
+  };
+
+  // ============================================================
+  // POLLING
+  // ============================================================
+
+  useEffect(() => {
+    fetchCameras();
+    fetchSystemStatus();
+
+    const interval = setInterval(() => {
+      fetchCameras();
+      fetchSystemStatus();
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // ============================================================
+  // START CAMERA
+  // ============================================================
+
+  const startCamera = async (cameraId) => {
+    setLoadingCamera(cameraId);
+
+    try {
+      const response = await fetch(
+        `${API}/api/cameras/${cameraId}/start`,
+        {
+          method: "POST",
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          "Failed to start camera"
+        );
+      }
+
+      setSelectedCamera(cameraId);
+
+      setApiError("");
+
+      // Give backend a moment to start
+      setTimeout(() => {
+        fetchCameras();
+      }, 800);
+    } catch (error) {
+      console.error(error);
+
+      setApiError(
+        `Unable to start ${cameraId}`
+      );
+    } finally {
+      setTimeout(() => {
+        setLoadingCamera(null);
+      }, 700);
+    }
+  };
+
+  // ============================================================
+  // STOP CAMERA
+  // ============================================================
+
+  const stopCamera = async (cameraId) => {
+    setLoadingCamera(cameraId);
+
+    try {
+      const response = await fetch(
+        `${API}/api/cameras/${cameraId}/stop`,
+        {
+          method: "POST",
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          "Failed to stop camera"
+        );
+      }
+
+      setApiError("");
+
+      setTimeout(() => {
+        fetchCameras();
+      }, 300);
+    } catch (error) {
+      console.error(error);
+
+      setApiError(
+        `Unable to stop ${cameraId}`
+      );
+    } finally {
+      setTimeout(() => {
+        setLoadingCamera(null);
+      }, 500);
+    }
+  };
+
+  // ============================================================
+  // STOP ALL CAMERAS
+  // ============================================================
+
+  const stopAllCameras = async () => {
+    try {
+      const activeCameras = cameras.filter(
+        (camera) => camera.running
+      );
+
+      await Promise.all(
+        activeCameras.map((camera) =>
+          fetch(
+            `${API}/api/cameras/${camera.id}/stop`,
+            {
+              method: "POST",
+            }
+          )
+        )
+      );
+
+      fetchCameras();
+    } catch (error) {
+      console.error(
+        "Stop all error:",
+        error
+      );
+    }
+  };
+
+  // ============================================================
+  // DASHBOARD CALCULATIONS
+  // ============================================================
+
+  const activeCameras = cameras.filter(
+    (camera) => camera.running
+  ).length;
+
+  const totalPersons = cameras.reduce(
+    (total, camera) =>
+      total +
+      Number(
+        camera.stats?.persons || 0
+      ),
+    0
+  );
+
+  const totalVehicles = cameras.reduce(
+    (total, camera) =>
+      total +
+      Number(
+        camera.stats?.vehicles || 0
+      ),
+    0
+  );
+
+  const totalAlerts = cameras.reduce(
+    (total, camera) =>
+      total +
+      Number(
+        camera.stats?.alerts || 0
+      ),
+    0
+  );
+
+  const totalDetections = cameras.reduce(
+    (total, camera) =>
+      total +
+      Number(
+        camera.stats?.detections || 0
+      ),
+    0
+  );
+
+  // ============================================================
+  // NAVIGATION
+  // ============================================================
+
+  const navigation = [
+    {
+      name: "Dashboard",
+      icon: "⌂",
+    },
+    {
+      name: "Live Monitoring",
+      icon: "◉",
+    },
+    {
+      name: "Camera Management",
+      icon: "▣",
+    },
+    {
+      name: "Alerts",
+      icon: "!",
+    },
+    {
+      name: "Detection Logs",
+      icon: "≡",
+    },
+    {
+      name: "Analytics",
+      icon: "▥",
+    },
+    {
+      name: "System Settings",
+      icon: "⚙",
+    },
+  ];
+
+  // ============================================================
+  // PAGE RENDERER
+  // ============================================================
+
+  const renderPage = () => {
+    switch (activeTab) {
+      case "Live Monitoring":
+        return (
+          <LiveMonitoring
+            cameras={cameras}
+            selected={selected}
+            selectedCamera={selectedCamera}
+            setSelectedCamera={
+              setSelectedCamera
+            }
+            startCamera={startCamera}
+            stopCamera={stopCamera}
+            loadingCamera={
+              loadingCamera
+            }
+          />
+        );
+
+      case "Camera Management":
+        return (
+          <CameraManagement
+            cameras={cameras}
+            selected={selected}
+            selectedCamera={selectedCamera}
+            setSelectedCamera={
+              setSelectedCamera
+            }
+            startCamera={startCamera}
+            stopCamera={stopCamera}
+            loadingCamera={
+              loadingCamera
+            }
+          />
+        );
+
+      case "Alerts":
+        return (
+          <AlertsPage
+            cameras={cameras}
+          />
+        );
+
+      case "Detection Logs":
+        return (
+          <DetectionLogs
+            cameras={cameras}
+          />
+        );
+
+      case "Analytics":
+        return (
+          <Analytics
+            cameras={cameras}
+          />
+        );
+
+      case "System Settings":
+        return (
+          <Settings
+            cameras={cameras}
+          />
+        );
+
+      default:
+        return (
+          <Dashboard
+            cameras={cameras}
+            selected={selected}
+            activeCameras={
+              activeCameras
+            }
+            totalPersons={
+              totalPersons
+            }
+            totalVehicles={
+              totalVehicles
+            }
+            totalAlerts={
+              totalAlerts
+            }
+            totalDetections={
+              totalDetections
+            }
+            setSelectedCamera={
+              setSelectedCamera
+            }
+            startCamera={startCamera}
+            stopCamera={stopCamera}
+            loadingCamera={
+              loadingCamera
+            }
+          />
+        );
+    }
+  };
+
+  // ============================================================
+  // MAIN UI
+  // ============================================================
+
+  return (
+    <div className="app-shell">
+
+      {/* ======================================================
+          SIDEBAR
+      ====================================================== */}
+
+      <aside className="sidebar">
+
+        <div className="brand">
+
+          <div className="brand-logo">
+            AI
+          </div>
+
+          <div>
+            <div className="brand-title">
+              BORDER<span>AI</span>
+            </div>
+
+            <div className="brand-subtitle">
+              INTELLIGENT SURVEILLANCE
+            </div>
+          </div>
+
+        </div>
+
+        <div className="sidebar-divider" />
+
+        <nav className="navigation">
+
+          {navigation.map((item) => (
+            <button
+              key={item.name}
+              className={`nav-item ${
+                activeTab === item.name
+                  ? "active"
+                  : ""
+              }`}
+              onClick={() =>
+                setActiveTab(item.name)
+              }
+            >
+              <span className="nav-icon">
+                {item.icon}
+              </span>
+
+              <span>
+                {item.name}
+              </span>
+            </button>
+          ))}
+
+        </nav>
+
+        <div className="sidebar-bottom">
+
+          <div className="system-indicator">
+
+            <span className="pulse-dot" />
+
+            <div>
+
+              <div className="indicator-title">
+                SYSTEM ONLINE
+              </div>
+
+              <div className="indicator-text">
+                AI Engine Operational
+              </div>
+
+            </div>
+
+          </div>
+
+          <button
+            className="shutdown-button"
+            onClick={
+              stopAllCameras
+            }
+          >
+            STOP ALL CAMERAS
+          </button>
+
+        </div>
+
+      </aside>
+
+      {/* ======================================================
+          MAIN AREA
+      ====================================================== */}
+
+      <main className="main-content">
+
+        <header className="topbar">
+
+          <div>
+
+            <div className="topbar-label">
+              BORDER SECURITY COMMAND CENTER
+            </div>
+
+            <h1>
+              {activeTab}
+            </h1>
+
+          </div>
+
+          <div className="topbar-right">
+
+            <div className="topbar-time">
+              {new Date().toLocaleTimeString(
+                "en-IN",
+                {
+                  hour12: false,
+                }
+              )}
+            </div>
+
+            <div className="topbar-status">
+
+              <span className="pulse-dot" />
+
+              ONLINE
+
+            </div>
+
+          </div>
+
+        </header>
+
+        {apiError && (
+          <div className="api-error">
+            {apiError}
+          </div>
+        )}
+
+        {renderPage()}
+
+      </main>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// DASHBOARD
+// ============================================================
+
+function Dashboard({
+  cameras,
+  selected,
+  activeCameras,
+  totalPersons,
+  totalVehicles,
+  totalAlerts,
+  totalDetections,
+  setSelectedCamera,
+  startCamera,
+  stopCamera,
+  loadingCamera,
+}) {
+  return (
+    <div className="page">
+
+      <div className="page-intro">
+
+        <div>
+
+          <div className="section-label">
+            SURVEILLANCE OVERVIEW
+          </div>
+
+          <h2>
+            AI Command Dashboard
+          </h2>
+
+          <p>
+            Real-time monitoring of the
+            intelligent border surveillance
+            network.
+          </p>
+
+        </div>
+
+      </div>
+
+      {/* ======================================================
+          STAT CARDS
+      ====================================================== */}
+
+      <div className="dashboard-stats">
+
+        <DashboardStat
+          label="ACTIVE CAMERAS"
+          value={activeCameras}
+          detail={`${cameras.length} configured`}
+        />
+
+        <DashboardStat
+          label="PERSONS"
+          value={totalPersons}
+          detail="Live detection"
+        />
+
+        <DashboardStat
+          label="VEHICLES"
+          value={totalVehicles}
+          detail="Live detection"
+        />
+
+        <DashboardStat
+          label="ALERTS"
+          value={totalAlerts}
+          detail={`${totalDetections} detections`}
+        />
+
+      </div>
+
+      {/* ======================================================
+          CAMERA NETWORK
+      ====================================================== */}
+
+      <section className="panel">
+
+        <div className="panel-header">
+
+          <div>
+
+            <div className="section-label">
+              SURVEILLANCE NETWORK
+            </div>
+
+            <h3>
+              Camera Nodes
+            </h3>
+
+          </div>
+
+          <div className="panel-count">
+            {activeCameras} ACTIVE /{" "}
+            {cameras.length} TOTAL
+          </div>
+
+        </div>
+
+        <div className="camera-grid">
+
+          {cameras.map((camera) => (
+
+            <CameraCard
+              key={camera.id}
+              camera={camera}
+              selected={
+                selected?.id === camera.id
+              }
+              onSelect={() =>
+                setSelectedCamera(
+                  camera.id
+                )
+              }
+              onStart={() =>
+                startCamera(
+                  camera.id
+                )
+              }
+              onStop={() =>
+                stopCamera(
+                  camera.id
+                )
+              }
+              loading={
+                loadingCamera ===
+                camera.id
+              }
+            />
+
+          ))}
+
+        </div>
+
+      </section>
+
+      {/* ======================================================
+          LIVE CAMERA
+      ====================================================== */}
+
+      <section className="panel">
+
+        <div className="panel-header">
+
+          <div>
+
+            <div className="section-label">
+              LIVE FEED
+            </div>
+
+            <h3>
+              {selected?.name ||
+                "No Camera Selected"}
+            </h3>
+
+          </div>
+
+          {selected?.running && (
+            <div className="live-badge">
+              <span className="pulse-dot" />
+              LIVE
+            </div>
+          )}
+
+        </div>
+
+        <CameraFeed
+          camera={selected}
+        />
+
+      </section>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// DASHBOARD STAT
+// ============================================================
+
+function DashboardStat({
+  label,
+  value,
+  detail,
+}) {
+  return (
+    <div className="stat-card">
+
+      <span className="stat-label">
+        {label}
+      </span>
+
+      <strong className="stat-value">
+        {value}
+      </strong>
+
+      <small className="stat-detail">
+        {detail}
+      </small>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// CAMERA MANAGEMENT
+// ============================================================
+
+function CameraManagement({
+  cameras,
+  selected,
+  selectedCamera,
+  setSelectedCamera,
+  startCamera,
+  stopCamera,
+  loadingCamera,
+}) {
+  const activeCount =
+    cameras.filter(
+      (camera) => camera.running
+    ).length;
+
+  return (
+    <div className="page">
+
+      <div className="page-intro">
+
+        <div>
+
+          <div className="section-label">
+            SURVEILLANCE NETWORK
+          </div>
+
+          <h2>
+            Camera Management
+          </h2>
+
+          <p>
+            Manage connected surveillance
+            sources and monitor their
+            real-time AI processing status.
+          </p>
+
+        </div>
+
+        <div className="big-counter">
+
+          {activeCount}
+
+          <span>
+            ACTIVE
+          </span>
+
+        </div>
+
+        <div className="big-counter">
+
+          {cameras.length}
+
+          <span>
+            TOTAL
+          </span>
+
+        </div>
+
+      </div>
+
+      <div className="management-layout">
+
+        {/* CAMERA LIST */}
+
+        <section className="panel camera-list-panel">
+
+          <div className="panel-header">
+
+            <div>
+
+              <div className="section-label">
+                CAMERA NODES
+              </div>
+
+              <h3>
+                Connected Cameras
+              </h3>
+
+            </div>
+
+          </div>
+
+          <div className="management-list">
+
+            {cameras.map((camera) => (
+
+              <CameraManagementCard
+                key={camera.id}
+                camera={camera}
+                selected={
+                  selectedCamera ===
+                  camera.id
+                }
+                onSelect={() =>
+                  setSelectedCamera(
+                    camera.id
+                  )
+                }
+                onStart={() =>
+                  startCamera(
+                    camera.id
+                  )
+                }
+                onStop={() =>
+                  stopCamera(
+                    camera.id
+                  )
+                }
+                loading={
+                  loadingCamera ===
+                  camera.id
+                }
+              />
+
+            ))}
+
+          </div>
+
+        </section>
+
+        {/* SELECTED CAMERA */}
+
+        <section className="panel selected-camera-panel">
+
+          <div className="panel-header">
+
+            <div>
+
+              <div className="section-label">
+                SELECTED NODE
+              </div>
+
+              <h3>
+                {selected?.id ||
+                  "NO CAMERA"}
+              </h3>
+
+            </div>
+
+            {selected?.running && (
+              <div className="live-badge">
+
+                <span className="pulse-dot" />
+
+                LIVE
+
+              </div>
+            )}
+
+          </div>
+
+          <CameraFeed
+            camera={selected}
+          />
+
+          {selected && (
+            <div className="selected-info">
+
+              <div>
+                <span>NAME</span>
+
+                <strong>
+                  {selected.name}
+                </strong>
+              </div>
+
+              <div>
+                <span>LOCATION</span>
+
+                <strong>
+                  {selected.location}
+                </strong>
+              </div>
+
+              <div>
+                <span>SOURCE</span>
+
+                <strong>
+                  {formatSource(
+                    selected.source
+                  )}
+                </strong>
+              </div>
+
+            </div>
+          )}
+
+        </section>
+
+      </div>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// LIVE MONITORING
+// ============================================================
+
+function LiveMonitoring({
+  cameras,
+  selected,
+  selectedCamera,
+  setSelectedCamera,
+  startCamera,
+  stopCamera,
+  loadingCamera,
+}) {
+  return (
+    <div className="page">
+
+      <div className="monitoring-toolbar">
+
+        <div>
+
+          <div className="section-label">
+            REAL-TIME SURVEILLANCE
+          </div>
+
+          <h2>
+            Live Monitoring
+          </h2>
+
+        </div>
+
+        <select
+          value={
+            selectedCamera || ""
+          }
+          onChange={(event) =>
+            setSelectedCamera(
+              event.target.value
+            )
+          }
+        >
+
+          {cameras.map((camera) => (
+
+            <option
+              key={camera.id}
+              value={camera.id}
+            >
+              {camera.id} —{" "}
+              {camera.name}
+            </option>
+
+          ))}
+
+        </select>
+
+      </div>
+
+      <div className="monitoring-layout">
+
+        <section className="panel large-feed">
+
+          <div className="panel-header">
+
+            <div>
+
+              <div className="section-label">
+                CAMERA FEED
+              </div>
+
+              <h3>
+                {selected?.name ||
+                  "No Camera Selected"}
+              </h3>
+
+            </div>
+
+            {selected?.running && (
+              <div className="live-badge">
+
+                <span className="pulse-dot" />
+
+                LIVE
+
+              </div>
+            )}
+
+          </div>
+
+          <CameraFeed
+            camera={selected}
+          />
+
+        </section>
+
+        <section className="panel">
+
+          <div className="panel-header">
+
+            <div>
+
+              <div className="section-label">
+                LIVE TELEMETRY
+              </div>
+
+              <h3>
+                AI Metrics
+              </h3>
+
+            </div>
+
+          </div>
+
+          <StatsGrid
+            stats={
+              selected?.stats ||
+              EMPTY_STATS
+            }
+          />
+
+        </section>
+
+      </div>
+
+      <section className="panel">
+
+        <div className="panel-header">
+
+          <div>
+
+            <div className="section-label">
+              CAMERA CONTROL
+            </div>
+
+            <h3>
+              {selected?.id ||
+                "NO CAMERA"}
+            </h3>
+
+          </div>
+
+        </div>
+
+        {selected && (
+          <div className="camera-control-row">
+
+            {selected.running ? (
+
+              <button
+                className="stop-btn"
+                onClick={() =>
+                  stopCamera(
+                    selected.id
+                  )
+                }
+                disabled={
+                  loadingCamera ===
+                  selected.id
+                }
+              >
+                {loadingCamera ===
+                selected.id
+                  ? "STOPPING..."
+                  : "STOP CAMERA"}
+              </button>
+
+            ) : (
+
+              <button
+                className="start-btn"
+                onClick={() =>
+                  startCamera(
+                    selected.id
+                  )
+                }
+                disabled={
+                  loadingCamera ===
+                  selected.id
+                }
+              >
+                {loadingCamera ===
+                selected.id
+                  ? "STARTING..."
+                  : "START CAMERA"}
+              </button>
+
+            )}
+
+          </div>
+        )}
+
+      </section>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// CAMERA CARD
+// ============================================================
+
+function CameraCard({
+  camera,
+  selected,
+  onSelect,
+  onStart,
+  onStop,
+  loading,
+}) {
+  return (
+    <div
+      className={`camera-card ${
+        selected
+          ? "selected"
+          : ""
+      }`}
+      onClick={onSelect}
+    >
+
+      <div className="camera-card-top">
+
+        <div className="camera-icon">
+          ▣
+        </div>
+
+        <div className="camera-status">
+
+          <span
+            className={`status-dot ${
+              camera.running
+                ? "running"
+                : camera.starting
+                ? "starting"
+                : ""
+            }`}
+          />
+
+          {camera.running
+            ? "ONLINE"
+            : camera.starting
+            ? "STARTING"
+            : "OFFLINE"}
+
+        </div>
+
+      </div>
+
+      <div className="camera-id">
+        {camera.id}
+      </div>
+
+      <div className="camera-name">
+        {camera.name}
+      </div>
+
+      <div className="camera-location">
+        {camera.location}
+      </div>
+
+      <div className="camera-actions">
+
+        {camera.running ? (
+
+          <button
+            className="stop-btn"
+            onClick={(event) => {
+              event.stopPropagation();
+              onStop();
+            }}
+            disabled={loading}
+          >
+            {loading
+              ? "..."
+              : "STOP"}
+          </button>
+
+        ) : (
+
+          <button
+            className="start-btn"
+            onClick={(event) => {
+              event.stopPropagation();
+              onStart();
+            }}
+            disabled={loading}
+          >
+            {loading
+              ? "..."
+              : "START"}
+          </button>
+
+        )}
+
+      </div>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// CAMERA MANAGEMENT CARD
+// ============================================================
+
+function CameraManagementCard({
+  camera,
+  selected,
+  onSelect,
+  onStart,
+  onStop,
+  loading,
+}) {
+  return (
+    <div
+      className={`management-camera ${
+        selected
+          ? "selected"
+          : ""
+      }`}
+      onClick={onSelect}
+    >
+
+      <div className="management-camera-icon">
+        ▣
+      </div>
+
+      <div className="management-camera-info">
+
+        <div className="management-camera-heading">
+
+          <strong>
+            {camera.id}
+          </strong>
+
+          <span
+            className={`status-label ${
+              camera.running
+                ? "online"
+                : camera.starting
+                ? "starting"
+                : "offline"
+            }`}
+          >
+
+            <span className="status-dot" />
+
+            {camera.running
+              ? "ONLINE"
+              : camera.starting
+              ? "STARTING"
+              : "OFFLINE"}
+
+          </span>
+
+        </div>
+
+        <div className="management-camera-name">
+          {camera.name}
+        </div>
+
+        <div className="management-camera-location">
+          {camera.location}
+        </div>
+
+      </div>
+
+      <div>
+
+        {camera.running ? (
+
+          <button
+            className="stop-btn"
+            onClick={(event) => {
+              event.stopPropagation();
+              onStop();
+            }}
+            disabled={loading}
+          >
+            {loading
+              ? "..."
+              : "STOP"}
+          </button>
+
+        ) : (
+
+          <button
+            className="start-btn"
+            onClick={(event) => {
+              event.stopPropagation();
+              onStart();
+            }}
+            disabled={loading}
+          >
+            {loading
+              ? "..."
+              : "START"}
+          </button>
+
+        )}
+
+      </div>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// CAMERA FEED
+// ============================================================
+
+function CameraFeed({ camera }) {
+
+  if (!camera) {
+    return (
+      <div className="feed-placeholder">
+
+        <div className="placeholder-icon">
+          ▣
+        </div>
+
+        <strong>
+          NO CAMERA SELECTED
+        </strong>
+
+        <span>
+          Select a camera from the
+          surveillance network.
+        </span>
+
+      </div>
+    );
+  }
+
+  if (!camera.running) {
+    return (
+      <div className="feed-placeholder">
+
+        <div className="placeholder-icon">
+          ◌
+        </div>
+
+        <strong>
+          CAMERA OFFLINE
+        </strong>
+
+        <span>
+          Start {camera.id} to begin
+          live AI surveillance.
+        </span>
+
+      </div>
+    );
+  }
+
+  return (
+    <div className="camera-feed">
+
+      <img
+        src={`${API}/api/cameras/${camera.id}/stream`}
+        alt={`${camera.id} live surveillance feed`}
+      />
+
+      <div className="feed-overlay top-left">
+        {camera.id}
+      </div>
+
+      <div className="feed-overlay top-right">
+        AI PROCESSING
+      </div>
+
+      <div className="feed-overlay bottom-left">
+        {camera.location}
+      </div>
+
+      <div className="feed-overlay bottom-right">
+        {Number(
+          camera.stats?.fps || 0
+        ).toFixed(1)}{" "}
+        FPS
+      </div>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// STATS GRID
+// ============================================================
+
+function StatsGrid({ stats }) {
+
+  const metrics = [
+    [
+      "PERSONS",
+      stats.persons,
+      "human",
+    ],
+    [
+      "VEHICLES",
+      stats.vehicles,
+      "vehicle",
+    ],
+    [
+      "TRACKS",
+      stats.tracks,
+      "track",
+    ],
+    [
+      "DETECTIONS",
+      stats.detections,
+      "detect",
+    ],
+    [
+      "INCIDENTS",
+      stats.incidents,
+      "incident",
+    ],
+    [
+      "ALERTS",
+      stats.alerts,
+      "alert",
+    ],
+    [
+      "PLATES",
+      stats.plates,
+      "plate",
+    ],
+    [
+      "INFERENCE",
+      `${Number(
+        stats.inference_ms || 0
+      ).toFixed(1)} ms`,
+      "speed",
+    ],
+  ];
+
+  return (
+    <div className="stats-grid">
+
+      {metrics.map(
+        ([label, value, type]) => (
+
+          <div
+            className={`metric-card ${type}`}
+            key={label}
+          >
+
+            <div className="metric-label">
+              {label}
+            </div>
+
+            <div className="metric-value">
+              {value}
+            </div>
+
+          </div>
+
+        )
+      )}
+
+      <div className="status-metric">
+
+        <span>
+          ANOMALY ENGINE
+        </span>
+
+        <strong>
+          {stats.anomaly ||
+            "NO DATA"}
+        </strong>
+
+      </div>
+
+      <div className="status-metric">
+
+        <span>
+          ANPR ENGINE
+        </span>
+
+        <strong>
+          {stats.anpr ||
+            "NO DATA"}
+        </strong>
+
+      </div>
+
+      {/* Scene light level, measured from the video frames by the
+          backend. Never inferred in the browser. */}
+      <div className="status-metric">
+
+        <span>
+          SCENE LIGHT
+        </span>
+
+        <strong>
+          {stats.night_context ||
+            "NO DATA"}
+        </strong>
+
+      </div>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// ALERTS
+// ============================================================
+
+function AlertsPage({ cameras }) {
+
+  const totalAlerts =
+    cameras.reduce(
+      (total, camera) =>
+        total +
+        Number(
+          camera.stats?.alerts || 0
+        ),
+      0
+    );
+
+  const totalIncidents =
+    cameras.reduce(
+      (total, camera) =>
+        total +
+        Number(
+          camera.stats?.incidents ||
+            0
+        ),
+      0
+    );
+
+  return (
+    <div className="page">
+
+      <div className="page-intro">
+
+        <div>
+
+          <div className="section-label">
+            SECURITY EVENTS
+          </div>
+
+          <h2>
+            Alerts & Incidents
+          </h2>
+
+          <p>
+            Real-time security events
+            generated by the AI
+            surveillance pipeline.
+          </p>
+
+        </div>
+
+        <div className="big-counter">
+
+          {totalAlerts}
+
+          <span>
+            ALERTS
+          </span>
+
+        </div>
+
+        <div className="big-counter">
+
+          {totalIncidents}
+
+          <span>
+            INCIDENTS
+          </span>
+
+        </div>
+
+      </div>
+
+      <section className="panel">
+
+        <div className="panel-header">
+
+          <div>
+
+            <div className="section-label">
+              EVENT MONITOR
+            </div>
+
+            <h3>
+              Camera Alert Status
+            </h3>
+
+          </div>
+
+        </div>
+
+        <div className="alert-list">
+
+          {cameras.map(
+            (camera) => (
+
+              <div
+                className="alert-row"
+                key={camera.id}
+              >
+
+                <div className="alert-severity">
+
+                  {Number(
+                    camera.stats?.alerts ||
+                      0
+                  ) > 0
+                    ? "!"
+                    : "✓"}
+
+                </div>
+
+                <div className="alert-info">
+
+                  <strong>
+                    {camera.id}
+                  </strong>
+
+                  <span>
+                    {Number(
+                      camera.stats?.alerts ||
+                        0
+                    )}{" "}
+                    alerts detected
+                  </span>
+
+                </div>
+
+                <div className="alert-count">
+                  {Number(
+                    camera.stats?.incidents ||
+                      0
+                  )}
+                </div>
+
+              </div>
+
+            )
+          )}
+
+        </div>
+
+      </section>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// DETECTION LOGS
+// ============================================================
+
+function DetectionLogs({
+  cameras,
+}) {
+  return (
+    <div className="page">
+
+      <div className="page-intro">
+
+        <div>
+
+          <div className="section-label">
+            AI ACTIVITY
+          </div>
+
+          <h2>
+            Detection Logs
+          </h2>
+
+          <p>
+            Current detection statistics
+            from all camera processing
+            nodes.
+          </p>
+
+        </div>
+
+      </div>
+
+      <section className="panel">
+
+        <div className="table-container">
+
+          <table>
+
+            <thead>
+
+              <tr>
+                <th>CAMERA</th>
+                <th>PERSONS</th>
+                <th>VEHICLES</th>
+                <th>TRACKS</th>
+                <th>DETECTIONS</th>
+                <th>FPS</th>
+                <th>INFERENCE</th>
+              </tr>
+
+            </thead>
+
+            <tbody>
+
+              {cameras.map(
+                (camera) => (
+
+                  <tr
+                    key={camera.id}
+                  >
+
+                    <td>
+
+                      <strong>
+                        {camera.id}
+                      </strong>
+
+                      <small>
+                        {camera.name}
+                      </small>
+
+                    </td>
+
+                    <td>
+                      {camera.stats?.persons ||
+                        0}
+                    </td>
+
+                    <td>
+                      {camera.stats?.vehicles ||
+                        0}
+                    </td>
+
+                    <td>
+                      {camera.stats?.tracks ||
+                        0}
+                    </td>
+
+                    <td>
+                      {camera.stats?.detections ||
+                        0}
+                    </td>
+
+                    <td>
+                      {Number(
+                        camera.stats?.fps ||
+                          0
+                      ).toFixed(1)}
+                    </td>
+
+                    <td>
+
+                      {Number(
+                        camera.stats
+                          ?.inference_ms ||
+                          0
+                      ).toFixed(1)}
+
+                      ms
+
+                    </td>
+
+                  </tr>
+
+                )
+              )}
+
+            </tbody>
+
+          </table>
+
+        </div>
+
+      </section>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// ANALYTICS
+// ============================================================
+
+function Analytics({
+  cameras,
+}) {
+  const totalPersons =
+    cameras.reduce(
+      (sum, camera) =>
+        sum +
+        Number(
+          camera.stats?.persons ||
+            0
+        ),
+      0
+    );
+
+  const totalVehicles =
+    cameras.reduce(
+      (sum, camera) =>
+        sum +
+        Number(
+          camera.stats?.vehicles ||
+            0
+        ),
+      0
+    );
+
+  const totalDetections =
+    cameras.reduce(
+      (sum, camera) =>
+        sum +
+        Number(
+          camera.stats?.detections ||
+            0
+        ),
+      0
+    );
+
+  const activeCameras =
+    cameras.filter(
+      (camera) =>
+        camera.running
+    ).length;
+
+  return (
+    <div className="page">
+
+      <div className="page-intro">
+
+        <div>
+
+          <div className="section-label">
+            OPERATIONAL ANALYTICS
+          </div>
+
+          <h2>
+            Surveillance Analytics
+          </h2>
+
+          <p>
+            Aggregated AI telemetry
+            across the surveillance
+            network.
+          </p>
+
+        </div>
+
+      </div>
+
+      <div className="analytics-cards">
+
+        <AnalyticsCard
+          title="PERSONS DETECTED"
+          value={totalPersons}
+        />
+
+        <AnalyticsCard
+          title="VEHICLES DETECTED"
+          value={totalVehicles}
+        />
+
+        <AnalyticsCard
+          title="TOTAL DETECTIONS"
+          value={totalDetections}
+        />
+
+        <AnalyticsCard
+          title="ACTIVE CAMERAS"
+          value={activeCameras}
+        />
+
+      </div>
+
+      <section className="panel">
+
+        <div className="panel-header">
+
+          <div>
+
+            <div className="section-label">
+              NETWORK PERFORMANCE
+            </div>
+
+            <h3>
+              Camera Performance
+            </h3>
+
+          </div>
+
+        </div>
+
+        <div className="performance-list">
+
+          {cameras.map(
+            (camera) => (
+
+              <div
+                className="performance-row"
+                key={camera.id}
+              >
+
+                <div className="performance-name">
+
+                  <strong>
+                    {camera.id}
+                  </strong>
+
+                  <span>
+                    {camera.name}
+                  </span>
+
+                </div>
+
+                <div className="performance-stat">
+
+                  <span>
+                    FPS
+                  </span>
+
+                  <strong>
+                    {Number(
+                      camera.stats?.fps ||
+                        0
+                    ).toFixed(1)}
+                  </strong>
+
+                </div>
+
+                <div className="performance-stat">
+
+                  <span>
+                    INFERENCE
+                  </span>
+
+                  <strong>
+
+                    {Number(
+                      camera.stats
+                        ?.inference_ms ||
+                        0
+                    ).toFixed(1)}
+
+                    ms
+
+                  </strong>
+
+                </div>
+
+                <div className="performance-stat">
+
+                  <span>
+                    DETECTIONS
+                  </span>
+
+                  <strong>
+                    {Number(
+                      camera.stats
+                        ?.detections ||
+                        0
+                    )}
+                  </strong>
+
+                </div>
+
+              </div>
+
+            )
+          )}
+
+        </div>
+
+      </section>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// ANALYTICS CARD
+// ============================================================
+
+function AnalyticsCard({
+  title,
+  value,
+}) {
+  return (
+    <div className="analytics-card">
+
+      <span>
+        {title}
+      </span>
+
+      <strong>
+        {value}
+      </strong>
+
+      <small>
+        REAL-TIME
+      </small>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+function Settings({
+  cameras,
+}) {
+
+  // Engine status is derived from what the running cameras actually report.
+  // With every camera stopped there is no live state to show, and these rows
+  // say so instead of claiming ACTIVE.
+  const live =
+    cameras.filter(
+      (camera) =>
+        camera.stats?.status === "ONLINE"
+    );
+
+  const first = live[0];
+
+  const engineStatus = {
+    online: live.length > 0,
+    tracking: live.length
+      ? `ACTIVE (${live.length} camera${
+          live.length === 1 ? "" : "s"
+        })`
+      : "IDLE - no camera running",
+    anomaly:
+      first?.stats?.anomaly ||
+      "IDLE - no camera running",
+    anpr:
+      first?.stats?.anpr ||
+      "IDLE - no camera running",
+    lowLight:
+      first?.stats?.night_context ||
+      "IDLE - no camera running",
+  };
+
+  return (
+    <div className="page">
+
+      <div className="page-intro">
+
+        <div>
+
+          <div className="section-label">
+            SYSTEM CONFIGURATION
+          </div>
+
+          <h2>
+            System Settings
+          </h2>
+
+          <p>
+            Current surveillance system
+            configuration.
+          </p>
+
+        </div>
+
+      </div>
+
+      <div className="settings-grid">
+
+        <section className="panel">
+
+          <div className="panel-header">
+
+            <div>
+
+              <div className="section-label">
+                AI ENGINE
+              </div>
+
+              <h3>
+                Detection Configuration
+              </h3>
+
+            </div>
+
+          </div>
+
+          <SettingRow
+            label="Object Detection"
+            value="YOLO"
+            active
+          />
+
+          {/* These read live backend state. A hard-coded "ACTIVE" would
+              still say ACTIVE with every camera stopped. */}
+          <SettingRow
+            label="Tracking"
+            value={engineStatus.tracking}
+            active={engineStatus.online}
+          />
+
+          <SettingRow
+            label="ANPR"
+            value={engineStatus.anpr}
+          />
+
+          <SettingRow
+            label="Anomaly Detection"
+            value={engineStatus.anomaly}
+            active={engineStatus.online}
+          />
+
+          <SettingRow
+            label="Low-light Detection"
+            value={engineStatus.lowLight}
+            active={engineStatus.online}
+          />
+
+        </section>
+
+        <section className="panel">
+
+          <div className="panel-header">
+
+            <div>
+
+              <div className="section-label">
+                NETWORK
+              </div>
+
+              <h3>
+                Camera Network
+              </h3>
+
+            </div>
+
+          </div>
+
+          <SettingRow
+            label="Configured Cameras"
+            value={cameras.length}
+            active
+          />
+
+          <SettingRow
+            label="Active Cameras"
+            value={
+              cameras.filter(
+                (camera) =>
+                  camera.running
+              ).length
+            }
+            active
+          />
+
+          <SettingRow
+            label="API"
+            value="FASTAPI"
+            active
+          />
+
+          <SettingRow
+            label="Frontend"
+            value="REACT"
+            active
+          />
+
+        </section>
+
+      </div>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// SETTING ROW
+// ============================================================
+
+function SettingRow({
+  label,
+  value,
+  active,
+}) {
+  return (
+    <div className="setting-row">
+
+      <span>
+        {label}
+      </span>
+
+      <strong
+        className={
+          active
+            ? "setting-active"
+            : ""
+        }
+      >
+        {value}
+      </strong>
+
+    </div>
+  );
+}
+
+
+// ============================================================
+// SOURCE FORMATTER
+// ============================================================
+
+function formatSource(source) {
+  if (!source) {
+    return "Unknown";
+  }
+
+  if (typeof source === "string") {
+    return source;
+  }
+
+  if (source.type === "video") {
+    return source.path || "Video";
+  }
+
+  if (source.type === "webcam") {
+    return `Webcam ${source.index ?? 0}`;
+  }
+
+  if (source.type === "rtsp") {
+    return "RTSP Stream";
+  }
+
+  return source.type || "Unknown";
+}
+
+
+// ============================================================
+// EXPORT
+// ============================================================
+
+export default App;
