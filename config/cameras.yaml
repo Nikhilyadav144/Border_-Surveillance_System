@@ -121,20 +121,35 @@ cameras:
   # No RTSP camera is needed for development - this entry is inert while
   # disabled, and the GUI shows it as CONFIGURED (OFFLINE).
   - id: "CAM-04"
-    name: "Perimeter CCTV (RTSP template)"
-    location: "Sector Charlie"
-    enabled: false
+    name: "Sector Delta - Highway Vehicle Checkpoint"
+    location: "Sector Delta"
+    enabled: true
     source:
-      type: rtsp
-      url: "rtsp://username:password@192.168.1.64:554/Streaming/Channels/101"
-      # Force TCP transport. UDP drops frames on lossy links.
-      transport: "tcp"
-      # Seconds to wait for the first frame before declaring the camera down.
-      open_timeout: 10
-      # Automatically try to reopen a dropped stream.
-      reconnect: true
-      reconnect_delay: 5
-      target_fps: null
-    # No geometry until this camera exists and someone draws polygons
-    # against its actual view.
+      type: video
+      # ANPR EVALUATION FOOTAGE.
+      #
+      # A dashcam run along a mountain highway with real Indian plates on
+      # real vehicles, which is what makes it useful here: the other four
+      # clips contain almost no legible plates, so ANPR had nothing to
+      # prove itself on.
+      #
+      # Measured on this file with the project's own engine, sampling
+      # every 10th frame (49 frames, 169 vehicle boxes above the minimum
+      # height):
+      #
+      #   EasyOCR    23 reads, 13.6% of attempts
+      #   Tesseract   3 reads,  1.8% of attempts
+      #
+      # EasyOCR reads PB39N0203 at 0.99 confidence and HP01M6777 at 0.68,
+      # both passing the Indian plate format check. Tesseract finds only
+      # one plate in the whole clip. That gap is why anpr.ocr_backend
+      # prefers EasyOCR.
+      #
+      # The clip is a moving dashcam, not a fixed camera, so it gets no
+      # zone geometry: a polygon drawn on frame 1 means nothing by frame
+      # 200. It is a vehicle and plate camera, not a boundary camera.
+      path: "ladakh_convoy.mp4"
+      loop: false
+      target_fps: 30
+    # Deliberately none. See the note above about the camera moving.
     zones_profile: "none"

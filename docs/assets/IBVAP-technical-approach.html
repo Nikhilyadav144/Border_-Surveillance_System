@@ -1,0 +1,606 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  /* ==================================================================
+     IBVAP - Technical Approach slide
+     ------------------------------------------------------------------
+     Sized for a 16:9 slide at 1920x1080 and rendered at 2x, so it stays
+     sharp when dropped into the SIH template and projected.
+
+     Light ground on purpose: the SIH deck template has a white slide
+     area, and a dark diagram pasted into it reads as a foreign object.
+
+     Every figure on this slide is one that was measured in the project.
+     No icon here is a vendor logo - they are plain geometric glyphs, so
+     the slide carries no third-party marks.
+     ================================================================== */
+
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap');
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    width: 1920px; height: 1080px;
+    font-family: Inter, system-ui, sans-serif;
+    color: #14202e;
+    background: #ffffff;
+    position: relative;
+    overflow: hidden;
+  }
+
+  /* --- palette, one hue per stage ------------------------------------ */
+  :root {
+    --ink:      #14202e;
+    --muted:    #5a6b7d;
+    --line:     #b9c6d4;
+
+    --input:    #128a6e;   --input-bg:    #e9f6f2;
+    --percept:  #b26a00;   --percept-bg:  #fdf2e2;
+    --analyse:  #8241c9;   --analyse-bg:  #f4edfd;
+    --judge:    #c0392b;   --judge-bg:    #fdeeec;
+    --deliver:  #1668a8;   --deliver-bg:  #e9f3fb;
+    --anpr:     #0f7a8a;   --anpr-bg:     #e8f5f7;
+  }
+
+  /* --- header -------------------------------------------------------- */
+  header {
+    padding: 34px 54px 0;
+    display: flex; align-items: flex-start; justify-content: space-between;
+  }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .mark {
+    width: 46px; height: 46px; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 10px;
+    background: #0d1b2a;
+  }
+  .brand-name {
+    font-size: 16px; font-weight: 800; letter-spacing: 2.4px; color: #0d1b2a;
+    line-height: 1.2;
+  }
+  .brand-sub {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px; letter-spacing: 1.7px; color: var(--muted);
+  }
+  h1 {
+    font-size: 46px; font-weight: 800; letter-spacing: 5px;
+    text-align: center; line-height: 1;
+  }
+  .h1-sub {
+    text-align: center; margin-top: 8px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px; letter-spacing: 2.6px; color: var(--muted);
+  }
+  .sih {
+    text-align: right; font-size: 13px; font-weight: 700;
+    letter-spacing: 1.6px; color: #0d1b2a; line-height: 1.45;
+  }
+  .sih span { color: var(--muted); font-weight: 500; letter-spacing: 1.2px; }
+
+  /* --- the pipeline -------------------------------------------------- */
+  .flow {
+    margin: 30px 44px 0;
+    display: grid;
+    grid-template-columns: 1fr 34px 1fr 34px 1.18fr 34px 1fr 34px 1fr;
+    align-items: stretch;
+  }
+
+  .zone {
+    border-radius: 16px;
+    padding: 18px 17px 20px;
+    display: flex; flex-direction: column;
+  }
+  .zone-head {
+    display: flex; align-items: center; gap: 9px;
+    padding-bottom: 9px; margin-bottom: 11px;
+    border-bottom: 2px solid currentColor;
+  }
+  .zone-title {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11.5px; font-weight: 600; letter-spacing: 1.5px;
+  }
+  .zone-num {
+    margin-left: auto;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 15px; font-weight: 600; opacity: .35;
+  }
+
+  .card {
+    background: #fff;
+    border: 1px solid rgba(20,32,46,.09);
+    border-radius: 10px;
+    padding: 11px 13px 12px;
+    margin-bottom: 10px;
+    box-shadow: 0 1px 2px rgba(20,32,46,.05);
+  }
+  .card:last-child { margin-bottom: 0; }
+  .card-t {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 14px; font-weight: 700; color: var(--ink);
+    line-height: 1.25;
+  }
+  .card-d {
+    margin-top: 3px;
+    font-size: 11.4px; line-height: 1.42; color: var(--muted);
+  }
+  .card-d b { color: #2c3c4e; font-weight: 600; }
+  .mono {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px; letter-spacing: .2px;
+  }
+
+  .arrow { display: flex; align-items: center; justify-content: center; }
+
+  /* --- the ANPR lane ------------------------------------------------- */
+  .lane {
+    margin: 20px 44px 0;
+    border-radius: 16px;
+    padding: 16px 18px 18px;
+    display: grid;
+    grid-template-columns: 218px 1fr;
+    gap: 18px;
+    align-items: center;
+  }
+  .lane-head { display: flex; align-items: center; gap: 10px; }
+  .lane-steps {
+    display: grid;
+    grid-template-columns: 1fr 26px 1fr 26px 1fr 26px 1.25fr;
+    align-items: center;
+  }
+  .step {
+    background: #fff;
+    border: 1px solid rgba(20,32,46,.09);
+    border-radius: 9px;
+    padding: 10px 13px 11px;
+  }
+  .step-t { font-size: 13px; font-weight: 700; }
+  .step-d { margin-top: 3px; font-size: 11px; line-height: 1.4; color: var(--muted); }
+
+  /* --- cross-cutting bands ------------------------------------------- */
+  .bands {
+    margin: 20px 44px 0;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 18px;
+  }
+  .band { border-radius: 16px; padding: 16px 18px 18px; }
+  .band-head {
+    display: flex; align-items: center; gap: 9px;
+    padding-bottom: 8px; margin-bottom: 10px;
+    border-bottom: 2px solid currentColor;
+  }
+  .band-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px;
+  }
+
+  /* --- footer -------------------------------------------------------- */
+  footer {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 13px 54px 15px;
+    background: #0d1b2a;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .tagline { color: #fff; font-size: 17px; font-weight: 600; letter-spacing: .2px; }
+  .tagline em { color: #4fc3f7; font-style: normal; }
+  .facts { display: flex; gap: 26px; }
+  .fact { text-align: right; }
+  .fact-v {
+    color: #fff; font-family: "JetBrains Mono", monospace;
+    font-size: 17px; font-weight: 600; line-height: 1;
+  }
+  .fact-l {
+    color: #8aa4bb; font-family: "JetBrains Mono", monospace;
+    font-size: 8.5px; letter-spacing: 1.2px; margin-top: 4px;
+  }
+</style>
+
+<header>
+  <div class="brand">
+    <div class="mark">
+      <svg width="28" height="28" viewBox="0 0 32 32" fill="none">
+        <path d="M4 7 L16 28 L28 7" stroke="#eaf4fb" stroke-width="2.6"
+              stroke-linejoin="round" stroke-linecap="round" fill="none"/>
+        <circle cx="16" cy="13" r="4.6" fill="#35c9ff"/>
+        <circle cx="17.6" cy="11.6" r="1.7" fill="#0d1b2a"/>
+      </svg>
+    </div>
+    <div>
+      <div class="brand-name">VISION VIGILANTS</div>
+      <div class="brand-sub">IBVAP SURVEILLANCE</div>
+    </div>
+  </div>
+
+  <div>
+    <h1>TECHNICAL APPROACH</h1>
+    <div class="h1-sub">INTELLIGENT BORDER VIDEO ANALYTICS PLATFORM</div>
+  </div>
+
+  <div class="sih">
+    SMART INDIA<br>HACKATHON<br><span>2026</span>
+  </div>
+</header>
+
+<!-- =================================================================
+     THE PIPELINE
+     Five stages, left to right, in the order a frame actually travels.
+     ================================================================= -->
+<div class="flow">
+
+  <!-- 1. INPUT ------------------------------------------------------ -->
+  <div class="zone" style="background:var(--input-bg); color:var(--input)">
+    <div class="zone-head">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="6" width="13" height="12" rx="2"/>
+        <path d="M15 10.5 L22 7 v10 l-7-3.5"/>
+      </svg>
+      <span class="zone-title">VIDEO INPUT</span>
+      <span class="zone-num">01</span>
+    </div>
+
+    <div class="card">
+      <div class="card-t">4 camera sources</div>
+      <div class="card-d">Own perimeter footage, highway dashcam,
+        border wall, RTSP template</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">OpenCV capture</div>
+      <div class="card-d">File, webcam or <b>RTSP</b> behind one interface,
+        so the pipeline never knows which</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Frame gate</div>
+      <div class="card-d">Every 2nd frame analysed. Halves compute and
+        loses nothing: a boundary cannot be crossed inside one frame</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">YAML configuration</div>
+      <div class="card-d mono">application · cameras · zones · threat_rules</div>
+    </div>
+  </div>
+
+  <div class="arrow">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#9fb0c2"
+         stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 12h15M13 6l6 6-6 6"/>
+    </svg>
+  </div>
+
+  <!-- 2. PERCEPTION ------------------------------------------------- -->
+  <div class="zone" style="background:var(--percept-bg); color:var(--percept)">
+    <div class="zone-head">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M1.6 12S5 5.5 12 5.5 22.4 12 22.4 12 19 18.5 12 18.5 1.6 12 1.6 12Z"/>
+        <circle cx="12" cy="12" r="3.2"/>
+      </svg>
+      <span class="zone-title">PERCEPTION</span>
+      <span class="zone-num">02</span>
+    </div>
+
+    <div class="card">
+      <div class="card-t">YOLOv8n detection</div>
+      <div class="card-d">6 classes of 80. <b>640 px</b>, confidence 0.35,
+        IoU 0.50</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">ByteTrack identity</div>
+      <div class="card-d">Published after <b>3 hits</b>, coasts 5 frames,
+        re-identified for 30</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">YOLOv8n-pose</div>
+      <div class="card-d"><b>17 keypoints</b> on a 192 px crop of the person,
+        not the whole frame, so a distant figure keeps resolution</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Pose history</div>
+      <div class="card-d">A time series per track: posture becomes something
+        with a direction and a speed</div>
+    </div>
+  </div>
+
+  <div class="arrow">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#9fb0c2"
+         stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 12h15M13 6l6 6-6 6"/>
+    </svg>
+  </div>
+
+  <!-- 3. ANALYSIS (the brain) --------------------------------------- -->
+  <div class="zone" style="background:var(--analyse-bg); color:var(--analyse)">
+    <div class="zone-head">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="5.5" cy="6" r="2.2"/><circle cx="5.5" cy="18" r="2.2"/>
+        <circle cx="18.5" cy="12" r="2.2"/><circle cx="11.5" cy="12" r="2.2"/>
+        <path d="M7.4 7.2 L9.9 10.6M7.4 16.8 L9.9 13.4M13.7 12 H16.3"/>
+      </svg>
+      <span class="zone-title">ANALYSIS &mdash; THE BRAIN</span>
+      <span class="zone-num">03</span>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Movement, in body heights</div>
+      <div class="card-d">Every distance and speed is measured in the person's
+        <b>own body height</b>, never in pixels. Walking scores 0.45 and
+        running 1.9 whether they are near the camera or far from it &mdash;
+        which is why one set of thresholds works on all four cameras and
+        no per-camera calibration exists</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Behaviour classifier</div>
+      <div class="card-d mono">WALKING · RUNNING · BENT_WALK · BENT_RUN ·
+        CROUCHING · JUMPING · FALLING · STANDING</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Boundary interaction</div>
+      <div class="card-d mono">NONE → APPROACHING → AT_BOUNDARY →
+        INTERACTING → CROSSED</div>
+      <div class="card-d">A crossing is armed, then confirmed, so a person
+        walking the fence is not a person going over it</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Isolation Forest anomaly</div>
+      <div class="card-d">scikit-learn, trained on <b>this camera's own</b>
+        normal movement. Refits every 25 samples</div>
+    </div>
+  </div>
+
+  <div class="arrow">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#9fb0c2"
+         stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 12h15M13 6l6 6-6 6"/>
+    </svg>
+  </div>
+
+  <!-- 4. JUDGEMENT -------------------------------------------------- -->
+  <div class="zone" style="background:var(--judge-bg); color:var(--judge)">
+    <div class="zone-head">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 2.6 20 6v6c0 4.8-3.4 8.2-8 9.4C7.4 20.2 4 16.8 4 12V6Z"/>
+        <path d="M9.2 12.2l2 2 3.6-4"/>
+      </svg>
+      <span class="zone-title">JUDGEMENT</span>
+      <span class="zone-num">04</span>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Threat engine</div>
+      <div class="card-d"><b>16 weighted factors</b> in a YAML file, not
+        buried in code, so the reasoning can be read and argued with</div>
+    </div>
+
+    <div class="card" style="padding-bottom:8px">
+      <div class="card-t">Four levels</div>
+      <div class="card-d mono" style="line-height:1.75">
+        <b style="color:#2e8b57">LOW</b> 0&ndash;24 &nbsp;
+        <b style="color:#c98a00">MEDIUM</b> 25&ndash;49<br>
+        <b style="color:#c0392b">HIGH</b> 50&ndash;74 &nbsp;
+        <b style="color:#8241c9">CRITICAL</b> 75+
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Incident &amp; alert</div>
+      <div class="card-d">Deduplicated, so a threat lasting 100 frames is
+        <b>one</b> incident and one alert, not a hundred</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Evidence capture</div>
+      <div class="card-d">Full frame and crop written at MEDIUM and above,
+        indexed to the incident that caused them</div>
+    </div>
+  </div>
+
+  <div class="arrow">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#9fb0c2"
+         stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 12h15M13 6l6 6-6 6"/>
+    </svg>
+  </div>
+
+  <!-- 5. DELIVERY --------------------------------------------------- -->
+  <div class="zone" style="background:var(--deliver-bg); color:var(--deliver)">
+    <div class="zone-head">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2.4" y="4" width="19.2" height="13" rx="2"/>
+        <path d="M8.5 21h7M12 17v4"/>
+      </svg>
+      <span class="zone-title">OPERATOR DELIVERY</span>
+      <span class="zone-num">05</span>
+    </div>
+
+    <div class="card">
+      <div class="card-t">FastAPI &mdash; one process</div>
+      <div class="card-d">Serves the API <b>and</b> the compiled dashboard on
+        port 8000. No second server, no CORS, nothing to go stale</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">React 19 command wall</div>
+      <div class="card-d">4 live feeds, threat timeline, evidence strip.
+        Boxes are drawn <b>server-side</b>, so the screen cannot show a
+        detection the pipeline did not make</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">SQLite &mdash; 16 tables</div>
+      <div class="card-d">WAL mode, a file not a server. Evidence as files
+        plus an index, never blobs</div>
+    </div>
+
+    <div class="card">
+      <div class="card-t">Access control</div>
+      <div class="card-d">scrypt hashing, 2 roles, enforced by the
+        <b>backend</b> on every request &mdash; not by hiding React routes</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- =================================================================
+     THE ANPR LANE
+     Runs only inside a detected vehicle box, so it costs nothing on a
+     camera with no vehicles in it. Drawn as its own lane because it is
+     a branch of the pipeline, not a stage of it.
+     ================================================================= -->
+<div class="lane" style="background:var(--anpr-bg); color:var(--anpr)">
+
+  <div class="lane-head">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2" y="6.5" width="20" height="11" rx="2"/>
+      <path d="M6 11v2.6M9.4 11v2.6M12.8 11v2.6M16.2 11v2.6M19 11v2.6"/>
+    </svg>
+    <div>
+      <div class="zone-title">ANPR BRANCH</div>
+      <div style="font-size:10.5px; color:var(--muted); margin-top:3px; line-height:1.35">
+        Runs only inside a vehicle box.<br>Optional: absent, it says so.
+      </div>
+    </div>
+  </div>
+
+  <div class="lane-steps">
+    <div class="step">
+      <div class="step-t">Plate region proposal</div>
+      <div class="step-d">Blackhat morphology raises dark-on-light text,
+        a Sobel pass finds the dense vertical edges characters make</div>
+    </div>
+
+    <div class="arrow">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9fb0c2"
+           stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 12h13M13 6l6 6-6 6"/>
+      </svg>
+    </div>
+
+    <div class="step">
+      <div class="step-t">EasyOCR</div>
+      <div class="step-d">Measured on our own footage:
+        <b>13.6%</b> hit rate against Tesseract's 1.8%</div>
+    </div>
+
+    <div class="arrow">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9fb0c2"
+           stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 12h13M13 6l6 6-6 6"/>
+      </svg>
+    </div>
+
+    <div class="step">
+      <div class="step-t">Vote per vehicle</div>
+      <div class="step-d">Reads grouped by tracked vehicle and resolved by
+        confidence weight &mdash; one car, one answer, not one row per frame</div>
+    </div>
+
+    <div class="arrow">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9fb0c2"
+           stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 12h13M13 6l6 6-6 6"/>
+      </svg>
+    </div>
+
+    <div class="step" style="border-color:rgba(15,122,138,.4); background:#f3fbfc">
+      <div class="step-t" style="color:var(--anpr)">RTO origin decoder</div>
+      <div class="step-d"><b>41 state codes, 998 district codes</b>, standard
+        library only. <span class="mono">PB39N0203 → Rajpura, Punjab</span> ·
+        <span class="mono">HR26BQ0008 → Gurgaon, Haryana</span>.
+        A code not in the table is reported as missing, never guessed</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- =================================================================
+     THE TWO BANDS THE REFERENCE DECK CALLS "TRUST" AND "RESPONSE".
+     Placed last because they are cross-cutting: they apply to every
+     stage above rather than sitting between two of them.
+     ================================================================= -->
+<div class="bands">
+
+  <div class="band" style="background:#f5f2fb; color:#6b4fa8">
+    <div class="band-head">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="4" y="10.5" width="16" height="10.5" rx="2"/>
+        <path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/>
+      </svg>
+      <span class="zone-title">EVIDENCE &amp; AUDIT TRAIL</span>
+    </div>
+    <div class="band-grid">
+      <div class="step">
+        <div class="step-t">Evidence, not screenshots</div>
+        <div class="step-d">Full frame and crop written at capture time and
+          indexed to the incident, camera, track and timestamp that produced
+          them. Served only through an authenticated route, never by path</div>
+      </div>
+      <div class="step">
+        <div class="step-t">Tokens never stored usable</div>
+        <div class="step-d">A session token exists only as its SHA-256
+          fingerprint in the database, so a copy of the database cannot be
+          replayed as a login</div>
+      </div>
+      <div class="step">
+        <div class="step-t">Audit log</div>
+        <div class="step-d">Every sign-in, refusal, user change and camera
+          command is recorded with who, what and when &mdash; including the
+          403s that were denied</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="band" style="background:#fdf6ec; color:#a9701a">
+    <div class="band-head">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M13 2.5 4 13.8h6.2L11 21.5 20 10.2h-6.2Z"/>
+      </svg>
+      <span class="zone-title">DEPLOYMENT &amp; OPERATION</span>
+    </div>
+    <div class="band-grid">
+      <div class="step">
+        <div class="step-t">Runs on one laptop</div>
+        <div class="step-d">No server, no container, no cloud account.
+          SQLite is a file and the models are three files totalling 19.6 MB,
+          so the whole system fits on the machine that runs it</div>
+      </div>
+      <div class="step">
+        <div class="step-t">One double-click</div>
+        <div class="step-d">A macOS app bundle stops any stale server, waits
+          for the API to actually answer rather than guessing, and reports
+          failure in a dialog instead of silently not opening</div>
+      </div>
+      <div class="step">
+        <div class="step-t">Degrades honestly</div>
+        <div class="step-d">Missing OCR engine, empty database and unreachable
+          backend are three different messages, because they need three
+          different fixes. Nothing is ever shown as a blank</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  <div class="tagline">
+    One process. No cloud. <em>Every number on screen is one the pipeline computed.</em>
+  </div>
+  <div class="facts">
+    <div class="fact"><div class="fact-v">460</div><div class="fact-l">TESTS PASSING</div></div>
+    <div class="fact"><div class="fact-v">29</div><div class="fact-l">ANALYSIS MODULES</div></div>
+    <div class="fact"><div class="fact-v">27</div><div class="fact-l">API ENDPOINTS</div></div>
+    <div class="fact"><div class="fact-v">19.6 MB</div><div class="fact-l">MODEL WEIGHTS</div></div>
+    <div class="fact"><div class="fact-v">0</div><div class="fact-l">CLOUD SERVICES</div></div>
+  </div>
+</footer>

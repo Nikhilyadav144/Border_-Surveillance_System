@@ -189,17 +189,46 @@ anpr:
   enabled: true
   # "auto" tries EasyOCR, then Tesseract, then disables itself and says so.
   # Force with "easyocr" or "tesseract".
+  #
+  # MEASURED, NOT ASSUMED. On CAM-04's highway clip, sampling every 10th
+  # frame (169 vehicle boxes above the minimum height):
+  #
+  #   EasyOCR    23 reads, 13.6% of attempts, reads PB39N0203 at 0.99
+  #   Tesseract   3 reads,  1.8% of attempts, finds one plate in the clip
+  #
+  # So "auto" is left in place, which tries EasyOCR first. If EasyOCR is
+  # not installed the engine falls back to Tesseract and says so in the
+  # log rather than silently reading almost nothing, and if neither is
+  # installed ANPR reports "No OCR backend installed" instead of
+  # pretending there were no vehicles.
   ocr_backend: "auto"
   # Minimum OCR confidence to accept a plate string. Below this the plate is
   # recorded as UNREADABLE and the crop is still saved as evidence.
   min_ocr_confidence: 0.45
   # Minimum vehicle box height in pixels before ANPR is attempted. Plates on
   # small distant vehicles are not resolvable.
+  #
+  # Kept at 90 deliberately. Lowering it does not find more plates, it just
+  # spends OCR time on vehicles whose plate is a dozen pixels wide and
+  # returns confident nonsense - which is worse than returning nothing,
+  # because nonsense has to be filtered back out further down.
   min_vehicle_height: 90
   # Do not re-run OCR on the same track more often than this.
-  cooldown_seconds: 3.0
+  #
+  # TUNED FROM MEASUREMENT, NOT GUESSED. At 3.0s this was built for a fixed
+  # camera watching a gate, where a vehicle sits in frame for a long time.
+  # CAM-04 is a moving dashcam and an oncoming car is in usable size for
+  # roughly two seconds, so a 3-second cooldown allowed about one attempt
+  # per vehicle - and one attempt means whatever that single frame happened
+  # to return, with nothing to check it against.
+  #
+  # The reads are now consolidated per track by vote (see /api/vehicles),
+  # and a vote needs voters. Shorter cooldown and more attempts cost CPU on
+  # a camera that has vehicles in it, and nothing at all on one that does
+  # not, because ANPR only runs inside a vehicle box.
+  cooldown_seconds: 0.4
   # Attempts per track before giving up.
-  max_attempts_per_track: 6
+  max_attempts_per_track: 14
   # Regex a candidate must match to be accepted. The default is a permissive
   # Indian-plate shape. Set to null to accept any alphanumeric result.
   plate_regex: "^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{3,4}$"

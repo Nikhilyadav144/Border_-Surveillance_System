@@ -205,20 +205,36 @@ if [ -n "${STALE// /}" ]; then
     fi
 fi
 
+# WHO IS LISTENING ON THE PORT
+# ---------------------------
+# `lsof -ti tcp:8000` is the obvious command and it is wrong. It matches
+# ANY socket involving port 8000, which includes the browser's own
+# connection TO the dashboard. So an open browser tab made the launcher
+# announce that "Google Chrome Helper" was occupying the port and refuse
+# to start. Chrome was a client, not a server.
+#
+# -sTCP:LISTEN restricts this to processes actually accepting
+# connections, which is the only thing that can genuinely block a bind.
+# -nP skips host and port name lookups, which makes it quicker too.
+
+listeners() {
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null
+}
+
 # A process disappearing and its socket being released are not the same
 # instant. Checking the port immediately after the kill can therefore see
 # the dying server still holding it and wrongly report a foreign program,
 # so the port is given a few seconds to come free before that conclusion
 # is drawn.
 for _ in $(seq 1 20); do
-    [ -z "$(lsof -ti tcp:${PORT} 2>/dev/null)" ] && break
+    [ -z "$(listeners)" ] && break
     sleep 0.5
 done
 
 # Still held after that, and it is not one of ours: something else owns
 # this port. Name it, rather than letting uvicorn fail with an opaque
 # "address already in use" inside a log nobody will open.
-HOLDER="$(lsof -ti tcp:${PORT} 2>/dev/null | head -1)"
+HOLDER="$(listeners | head -1)"
 if [ -n "$HOLDER" ]; then
     HOLDER_NAME="$(ps -p "$HOLDER" -o comm= 2>/dev/null)"
     die "Port ${PORT} is already being used by another program:
@@ -231,6 +247,18 @@ fi
 # ---------------------------------------------------------------------
 # 3. Start the one and only server
 # ---------------------------------------------------------------------
+
+# Launched from the Dock there is no window yet and the server takes a
+# few seconds to come up, so without this the app looks like it did
+# nothing. A notification says it is working before the browser appears.
+notify() {
+    osascript \
+        -e 'on run {t, m}' \
+        -e 'display notification m with title t' \
+        -e 'end run' \
+        -- "$1" "$2" >/dev/null 2>&1
+}
+notify "IBVAP" "Starting the surveillance platform..."
 
 say "starting the IBVAP server on port ${PORT}"
 say "interpreter: $VENV_PY"
@@ -277,7 +305,7 @@ $TAIL"
     # a process about to vanish. Requiring OUR pid to be the one holding
     # the port makes the check mean what it is supposed to mean.
     if curl -fsS --max-time 2 "$HEALTH" > /dev/null 2>&1 \
-       && lsof -ti tcp:"$PORT" 2>/dev/null | grep -qx "$SERVER_PID"; then
+       && listeners | grep -qx "$SERVER_PID"; then
         READY="yes"
         break
     fi
@@ -344,6 +372,7 @@ fi
 # ---------------------------------------------------------------------
 
 say "opening $URL"
+notify "IBVAP is ready" "Opening the dashboard."
 open "$URL"
 
 say "IBVAP is running. Quit this app from the Dock to stop it."

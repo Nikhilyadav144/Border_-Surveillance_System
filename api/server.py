@@ -20,6 +20,9 @@ from api.auth_routes import admin_router, auth_router
 from api.deps import AuthSettings
 from core.auth import AuditAction, Principal
 from core.config import load_config
+from core.rto import decode as decode_plate_origin
+from core.plate_colour import classify_file as classify_plate_colour
+from core.plate_grammar import normalise as repair_plate
 from core.pipeline import SurveillancePipeline
 from database.database import Database
 from inputs.factory import build_source, describe_source
@@ -1267,6 +1270,10 @@ def _event_row(row: Any) -> dict[str, Any]:
         "ts": data.get("ts"),
         "ts_text": ts_text,
         "time": time_only,
+        # The date on its own, so a timeline can show it beside the clock.
+        # A timeline that shows only a time reads as "today" even when its
+        # newest entry is a week old.
+        "date": ts_text.split(" ")[0] if ts_text else "",
     }
 
 
@@ -1382,17 +1389,495 @@ def camera_events(
 # PLATES
 # ============================================================
 
-@app.get("/api/plates")
-def plates(_user: Principal = Depends(deps.require_user)):
+# ============================================================
+# EVIDENCE
+# ============================================================
+#
+# The pipeline already writes a full frame and a cropped snapshot for every
+# incident at or above the configured threat level, and indexes them in the
+# evidence table. Nothing here captures anything; these two routes only hand
+# back what the analysis already produced.
 
-    rows = db.get_plates(
-        limit=100
+
+def _evidence_row(row: Any) -> dict[str, Any]:
+    """One evidence file as the detection strip wants to read it."""
+    data = dict(row)
+
+    detail = {}
+    raw_detail = data.get("detail")
+    if raw_detail:
+        try:
+            detail = json.loads(raw_detail)
+        except (TypeError, ValueError):
+            detail = {}
+
+    behaviour = detail.get("behaviour")
+    if behaviour == "UNKNOWN":
+        # Same rule as the event log: the classifier concluding nothing is
+        # reported as nothing, never dressed up as a behaviour.
+        behaviour = None
+
+    ts_text = str(data.get("ts_text") or "")
+
+    return {
+        "id": data.get("id"),
+        "incident_id": data.get("incident_id"),
+        "session_id": data.get("session_id"),
+        "camera_id": data.get("camera_id"),
+        "track_id": data.get("track_number"),
+        "object_type": data.get("object_class"),
+        "kind": data.get("kind"),
+        "behaviour": behaviour,
+        "threat_level": data.get("threat_level"),
+        "threat_score": data.get("threat_score"),
+        "headline": _headline(str(data.get("incident_type") or ""), behaviour),
+        "width": data.get("width"),
+        "height": data.get("height"),
+        # The URL the browser loads. Built here so the client never has to
+        # know that evidence lives in files at all.
+        "image_url": f"/api/evidence/{data.get('id')}/image",
+        "ts": data.get("ts"),
+        "ts_text": ts_text,
+        "time": ts_text.split(" ")[-1] if ts_text else "",
+        "date": ts_text.split(" ")[0] if ts_text else "",
+    }
+
+
+@app.get("/api/evidence")
+def evidence_list(
+    camera_id: str | None = None,
+    session_id: int | None = None,
+    session_ids: str | None = None,
+    kind: str = "crop",
+    limit: int = 24,
+    _user: Principal = Depends(deps.require_user),
+):
+    """Recent evidence snapshots, newest first, captioned with the incident.
+
+    Scoped exactly like `/api/events`, and for the same reason: the pictures
+    beside a set of totals must come from the same run those totals describe,
+    or the strip becomes a museum of older sessions.
+    """
+    parsed: list[int] | None = None
+    if session_ids is not None:
+        parsed = []
+        for piece in session_ids.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                parsed.append(int(piece))
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"session_ids must be integers, got {piece!r}",
+                )
+
+    rows = db.get_evidence_captioned(
+        camera_id=camera_id,
+        session_id=session_id,
+        session_ids=parsed,
+        kind=None if kind == "all" else kind,
+        limit=max(1, min(int(limit), 200)),
+    )
+    return [_evidence_row(row) for row in rows]
+
+
+@app.get("/api/evidence/{evidence_id}/image")
+async def evidence_image(evidence_id: int, request: Request,
+                         token: str | None = None):
+    """The JPEG behind one evidence row.
+
+    Authenticated by query token as well as by header, for the same reason
+    the camera stream is: a browser loading this through `<img src="...">`
+    will not attach an Authorization header, and an unauthenticated evidence
+    route would hand out pictures of the people the system detected.
+
+    The path is never taken from the request. The caller supplies a row id;
+    the path comes from our own evidence table. It is still checked to be
+    inside the configured evidence directory before anything is opened, so
+    that a corrupted or tampered row cannot turn this into a way to read
+    arbitrary files off the server.
+    """
+    principal = deps.resolve_principal(request)
+    if principal is None and token:
+        principal = deps.principal_from_token(token)
+    if principal is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated. Please sign in.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    row = db.get_evidence_file(evidence_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    path = Path(str(dict(row).get("file_path") or ""))
+    root = Path(config.path("evidence_dir")).resolve()
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        # Outside the evidence directory, or unresolvable. Reported as a
+        # missing file rather than as a path problem, because the caller has
+        # no business learning where anything is on disk.
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    if not resolved.is_file():
+        # Retention may have purged it. The row outliving the file is normal
+        # and is not an error worth alarming anybody about.
+        raise HTTPException(status_code=404, detail="Evidence file is gone")
+
+    return FileResponse(
+        resolved,
+        media_type="image/jpeg",
+        headers={
+            # Evidence is immutable once written, so it can be cached hard.
+            "Cache-Control": "private, max-age=86400",
+        },
     )
 
-    return [
-        dict(row)
-        for row in rows
-    ]
+
+def _plate_row(row: Any) -> dict[str, Any]:
+    """One plate read, with the state and district it was registered in.
+
+    WHY THE ORIGIN IS WORKED OUT HERE AND NOT STORED
+    ------------------------------------------------
+    The state and district are a pure function of the plate string, so
+    storing them would mean freezing today's answer into every row. The RTO
+    table gets corrected and extended over time; decoding on read means a
+    better table immediately improves every plate already recorded, instead
+    of leaving old rows carrying an old answer. It also means the ANPR
+    pipeline did not have to change at all to gain this.
+
+    `origin_known` and `district_known` are reported separately and on
+    purpose. A plate whose state is known but whose district code is not in
+    the table is a partial answer, and the interface must be able to say so
+    rather than render a blank that looks like a failed read.
+    """
+    data = dict(row)
+    origin = decode_plate_origin(data.get("plate_text"))
+
+    ts_text = str(data.get("ts_text") or "")
+    data.update({
+        "state": origin.state,
+        "state_code": origin.state_code,
+        "district": origin.district,
+        "district_code": origin.district_code,
+        "origin": origin.summary(),
+        "origin_known": origin.known,
+        "district_known": origin.district_known,
+        "time": ts_text.split(" ")[-1] if ts_text else "",
+        "date": ts_text.split(" ")[0] if ts_text else "",
+        # Served through the evidence route rather than as a file path, so
+        # the browser never learns where anything sits on disk.
+        "image_url": (f"/api/plates/{data.get('id')}/image"
+                      if data.get("evidence_path") else None),
+    })
+    # The path on disk is not the client's business, but the colour
+    # classifier one layer up still needs it. Kept under a private key
+    # that the vehicle grouping reads and never serialises.
+    data["_evidence_path"] = data.pop("evidence_path", None)
+    return data
+
+
+@app.get("/api/plates")
+def plates(
+    camera_id: str | None = None,
+    limit: int = 100,
+    unread: bool = True,
+    _user: Principal = Depends(deps.require_user),
+):
+    """Recent plate reads, newest first, decoded to state and district.
+
+    `unread=False` hides rows where OCR returned nothing. Those rows are
+    real and are kept - a vehicle whose plate could not be read is a fact
+    about the run, not a blank to be swept up - but a demonstration panel
+    usually wants the ones that were actually read.
+    """
+    rows = db.get_plates(limit=max(1, min(int(limit), 500)))
+
+    out = [_plate_row(row) for row in rows]
+    if camera_id:
+        out = [r for r in out if r.get("camera_id") == camera_id]
+    if not unread:
+        out = [r for r in out if r.get("plate_text")]
+    # Strip the private key before it leaves the building.
+    for row in out:
+        row.pop("_evidence_path", None)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Consolidating repeated reads of one vehicle
+# ---------------------------------------------------------------------------
+#
+# A vehicle is read several times as it crosses the frame, and OCR returns a
+# slightly different string almost every time. On CAM-04's clip one car
+# produced "PB12449880", "P8124H9880", "PB12A49880" and "PB12109880" - four
+# rows in the plates table, one car in the world.
+#
+# Showing those four separately makes a working system look broken. Showing
+# only the first makes the answer depend on which frame happened to come
+# first. So the reads are grouped by the TRACK they belong to - the tracker
+# already knows those frames were the same vehicle - and the group is
+# resolved to one answer.
+#
+# This happens here rather than in the pipeline for the same reason the
+# origin lookup does: it is a pure function of rows already recorded, so it
+# changes no capture code, and improving it improves every run already in
+# the database. Every individual read stays in the table, untouched, and
+# /api/plates still returns them.
+
+
+def _plate_is_plausible(text: str | None) -> bool:
+    """Whether a read looks like a real Indian plate at all.
+
+    The test is deliberately not a confidence threshold. Confidence says how
+    sure the OCR was about the pixels, which is a different question from
+    whether the result can be a registration number. "JOH020J" was returned
+    at 0.52 - reasonably confident, and not a plate.
+
+    So the RTO table itself is the validator: a plate has to start with a
+    real state code. That is a fact about how India registers vehicles, not
+    a tunable, and it rejects the letter-for-digit misreads that a
+    confidence cut lets through.
+    """
+    if not text:
+        return False
+    return decode_plate_origin(text).known
+
+
+def _resolve_group(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pick one answer from repeated reads of the same vehicle.
+
+    Ordering, most important first:
+
+      1. it has to look like a plate at all (see above);
+      2. a read that passed the configured plate-format check beats one
+         that did not;
+      3. then the total confidence of everyone who agreed on that exact
+         string, so three mediocre agreeing reads beat one lucky outlier;
+      4. then the single best confidence, as a tie-break.
+
+    The losing candidates are returned as `alternatives` rather than
+    discarded. An operator looking at a contested plate should be able to
+    see that it was contested.
+    """
+    candidates: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        raw = row.get("plate_text")
+
+        # REPAIR BEFORE VOTING
+        # --------------------
+        # An Indian plate's character classes are fixed, so a digit where
+        # a letter must be is a misread with a knowable correction. The
+        # lead vehicle on CAM-04 reads as HR26800008; repaired it is
+        # HR26BO0008, which is a valid plate and - the part that matters -
+        # carries the right state and district.
+        #
+        # Repairing before the vote also makes the vote stronger, because
+        # readings that differed only by a confusion now agree.
+        reading = repair_plate(raw) if raw else None
+        text = reading.text if reading and reading.valid else raw
+        repaired = bool(reading and reading.repaired)
+
+        if not _plate_is_plausible(text):
+            continue
+        conf = float(row.get("ocr_confidence") or 0.0)
+        entry = candidates.setdefault(text, {
+            "plate_text": text, "reads": 0, "weight": 0.0,
+            "best_confidence": 0.0, "validated": False, "row": row,
+            "repaired": False,
+        })
+        entry["repaired"] = entry["repaired"] or repaired
+        entry["reads"] += 1
+        entry["weight"] += conf
+        if conf > entry["best_confidence"]:
+            entry["best_confidence"] = conf
+            entry["row"] = row
+        if row.get("validated"):
+            entry["validated"] = True
+
+    first = rows[0]
+    base = {
+        "camera_id": first.get("camera_id"),
+        "track_id": first.get("track_number"),
+        "attempts": len(rows),
+        "ts": first.get("ts"),
+        "ts_text": first.get("ts_text"),
+        "date": first.get("date"),
+        "time": first.get("time"),
+    }
+
+    if not candidates:
+        # Every read was unusable. That is a real outcome and it is
+        # reported as one, rather than by omitting the vehicle or by
+        # showing the least-bad piece of nonsense.
+        return {
+            **base,
+            "plate_text": None,
+            "readable": False,
+            "reads": 0,
+            "confidence": 0.0,
+            "validated": False,
+            "repaired": False,
+            "origin": "Plate not readable",
+            "origin_known": False,
+            "district_known": False,
+            "state": None, "state_code": None,
+            "district": None, "district_code": None,
+            "image_url": None,
+            "plate_colour": None,
+            "vehicle_class": None,
+            "vehicle_class_note": None,
+            "commercial": None,
+            "alternatives": [],
+        }
+
+    ranked = sorted(
+        candidates.values(),
+        key=lambda c: (c["validated"], c["weight"], c["best_confidence"]),
+        reverse=True,
+    )
+    winner = ranked[0]
+    row = winner["row"]
+    origin = decode_plate_origin(winner["plate_text"])
+
+    # PLATE COLOUR = VEHICLE CLASS
+    # ----------------------------
+    # In India the background colour of a plate is a legal classification,
+    # not decoration: yellow is commercial (taxi, cab, truck, bus), white
+    # is private, green is electric. At a checkpoint "that is a vehicle
+    # for hire" is an operationally different fact from "that is a private
+    # car", and it is available from the crop the pipeline already saved.
+    #
+    # Read here rather than at capture for the same reason the origin is:
+    # it is a pure function of a stored image, so improving the classifier
+    # improves every plate already recorded, and the capture pipeline did
+    # not have to change to gain it.
+    #
+    # Only attempted for a plate that READ as a plate. A crop the OCR
+    # could not make sense of is usually not a plate at all - a wheel
+    # arch, a window, a shadow - and running a colour classifier over
+    # those produced confident nonsense about vehicle classes.
+    colour = classify_plate_colour(row["_evidence_path"]) \
+        if row.get("_evidence_path") else None
+
+    return {
+        **base,
+        "plate_text": winner["plate_text"],
+        "readable": True,
+        "reads": winner["reads"],
+        "confidence": round(winner["best_confidence"], 3),
+        "validated": winner["validated"],
+        # Whether the grammar repair changed anything. Shown, because a
+        # corrected reading is a weaker claim than a clean one.
+        "repaired": bool(winner.get("repaired")),
+        "origin": origin.summary(),
+        "origin_known": origin.known,
+        "district_known": origin.district_known,
+        "state": origin.state,
+        "state_code": origin.state_code,
+        "district": origin.district,
+        "district_code": origin.district_code,
+        "image_url": row.get("image_url"),
+        # None when the colour could not be told, so the interface shows
+        # nothing rather than a guessed vehicle class.
+        "plate_colour": colour.scheme if colour and colour.known else None,
+        "vehicle_class": colour.category if colour and colour.known else None,
+        "vehicle_class_note": colour.meaning if colour and colour.known else None,
+        "commercial": bool(colour.is_commercial) if colour and colour.known else None,
+        "alternatives": [
+            {"plate_text": c["plate_text"], "reads": c["reads"],
+             "confidence": round(c["best_confidence"], 3)}
+            for c in ranked[1:4]
+        ],
+    }
+
+
+@app.get("/api/vehicles")
+def vehicles(
+    camera_id: str | None = None,
+    limit: int = 50,
+    readable_only: bool = True,
+    _user: Principal = Depends(deps.require_user),
+):
+    """One row per tracked vehicle, with its plate resolved and decoded.
+
+    This is what an operator wants to read: a list of vehicles, not a list
+    of OCR attempts. `/api/plates` still returns every individual read for
+    anyone who needs to audit how an answer was reached.
+
+    `readable_only=false` also returns the vehicles whose plate could not
+    be read. They are worth showing on a checkpoint camera - a vehicle
+    passed and its plate was not captured is a finding, not a blank.
+    """
+    rows = [_plate_row(row) for row in db.get_plates(limit=500)]
+    if camera_id:
+        rows = [r for r in rows if r.get("camera_id") == camera_id]
+
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(
+            (row.get("camera_id"), row.get("track_number")), []
+        ).append(row)
+
+    out = [_resolve_group(group) for group in groups.values()]
+    if readable_only:
+        out = [v for v in out if v["readable"]]
+    # Plates that were read come first, then the ones that were not, each
+    # group newest first. Sorting purely by time buries every successful
+    # read under whichever vehicles passed most recently without giving up
+    # a plate - which makes a working reader look like a broken one.
+    out.sort(key=lambda v: (v["readable"], v.get("ts") or 0), reverse=True)
+    return out[:max(1, min(int(limit), 200))]
+
+
+@app.get("/api/plates/{plate_id}/image")
+async def plate_image(plate_id: int, request: Request,
+                      token: str | None = None):
+    """The plate crop captured for one read.
+
+    Query token accepted for the same reason as the stream and the evidence
+    route: a browser will not attach an Authorization header to an <img>.
+
+    The path comes from our own plates table, never from the request, and
+    is still checked to lie inside the configured evidence directory before
+    anything is opened.
+    """
+    principal = deps.resolve_principal(request)
+    if principal is None and token:
+        principal = deps.principal_from_token(token)
+    if principal is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated. Please sign in.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    match = [r for r in db.get_plates(limit=500) if dict(r).get("id") == plate_id]
+    if not match:
+        raise HTTPException(status_code=404, detail="Plate read not found")
+
+    path_text = dict(match[0]).get("evidence_path")
+    if not path_text:
+        raise HTTPException(status_code=404, detail="No image for this read")
+
+    root = Path(config.path("evidence_dir")).resolve()
+    try:
+        resolved = Path(str(path_text)).resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="Plate image not found")
+
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Plate image is gone")
+
+    return FileResponse(resolved, media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
 
 # ============================================================
 # AUTHENTICATION ROUTES

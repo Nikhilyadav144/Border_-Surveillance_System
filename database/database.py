@@ -493,6 +493,86 @@ class Database:
     def get_incident(self, incident_id: int) -> Optional[sqlite3.Row]:
         return self.query_one("SELECT * FROM incidents WHERE id=?", (incident_id,))
 
+    def get_evidence_captioned(
+        self,
+        camera_id: str | None = None,
+        session_id: int | None = None,
+        session_ids: "list[int] | None" = None,
+        kind: str | None = "crop",
+        limit: int = 24,
+    ) -> list[sqlite3.Row]:
+        """Recent evidence images, newest first, with what they are OF.
+
+        Named apart from the plain ``get_evidence`` below, which returns raw
+        evidence rows and is used by the retention and evidence-browser
+        paths. Two methods in one class body cannot share a name: the second
+        silently replaces the first, which is exactly the bug this rename
+        fixes.
+
+        An evidence file on its own is a JPEG with a filename. Joined to its
+        incident it becomes "Person #02, bent run, HIGH, 12:31:27" - which is
+        the only form the operator can use. So the join happens here, in one
+        query, rather than the client fetching a list of files and then a
+        list of incidents and trying to pair them up.
+
+        INNER JOIN, unlike get_events: an evidence row whose incident has
+        gone is an orphan we cannot caption, and showing an uncaptioned
+        thumbnail in a threat log is worse than showing nothing.
+
+        `kind` defaults to "crop" because the thumbnail strip wants the
+        object, not the whole scene. Pass None for both kinds, or
+        "full_frame" for the wide shot.
+
+        Scoping matches get_events exactly, including the rule that an empty
+        `session_ids` returns nothing rather than widening to all history.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if camera_id:
+            clauses.append("e.camera_id=?")
+            params.append(camera_id)
+        if kind:
+            clauses.append("e.kind=?")
+            params.append(kind)
+        if session_id is not None:
+            clauses.append("i.session_id=?")
+            params.append(session_id)
+        if session_ids is not None:
+            if not session_ids:
+                return []
+            marks = ",".join("?" for _ in session_ids)
+            clauses.append(f"i.session_id IN ({marks})")
+            params.extend(int(value) for value in session_ids)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+
+        with self._cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT e.id, e.incident_id, e.camera_id, e.track_number,
+                       e.kind, e.file_path, e.width, e.height, e.bytes,
+                       e.ts, e.ts_text,
+                       i.session_id, i.incident_type, i.object_class,
+                       i.threat_level, i.threat_score, i.detail
+                FROM evidence e
+                JOIN incidents i ON i.id = e.incident_id
+                {where}
+                ORDER BY e.ts DESC, e.id DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            return cur.fetchall()
+
+    def get_evidence_file(self, evidence_id: int) -> "sqlite3.Row | None":
+        """One evidence row by id, for serving the image behind it."""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT id, camera_id, file_path, kind FROM evidence WHERE id=?",
+                (int(evidence_id),),
+            )
+            return cur.fetchone()
+
     def get_events(
         self,
         camera_id: str | None = None,

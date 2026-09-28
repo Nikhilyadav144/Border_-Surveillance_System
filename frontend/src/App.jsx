@@ -155,7 +155,6 @@ const ADMIN_ONLY_PAGES = new Set([
 function pagesForRole(isAdmin) {
   const all = [
     { name: "Dashboard", icon: "⌂" },
-    { name: "Live Monitoring", icon: "◉" },
     { name: "Camera Management", icon: "▣" },
     { name: "Alerts", icon: "!" },
     { name: "Detection Logs", icon: "≡" },
@@ -220,17 +219,34 @@ function Login({ onSignedIn }) {
       }
 
       if (!response.ok) {
-        // The backend decides what a failure means and says so in one
-        // sentence. React does not second-guess it, and in particular does
-        // not try to tell "no such user" from "wrong password" - the
-        // backend deliberately does not distinguish them either.
+        // A failed sign-in and a missing endpoint are completely different
+        // problems, and calling both "INVALID CREDENTIALS" sends somebody
+        // hunting for a password mistake that was never there. 404 here has
+        // exactly one cause worth naming.
+        if (response.status === 404) {
+          setError({
+            title: "BACKEND OUT OF DATE",
+            message:
+              "The API is running but has no /api/auth/login route, so it " +
+              "is serving an older build. uvicorn does not reload on its " +
+              "own: stop it and start it again.",
+          });
+          return;
+        }
+
+        // Below this line the backend decided what the failure means and
+        // said so in one sentence. React does not second-guess it, and in
+        // particular does not try to tell "no such user" from "wrong
+        // password" - the backend deliberately does not distinguish them.
         setError({
           title:
             response.status === 403
               ? "ACCOUNT DISABLED"
               : response.status === 429
               ? "TOO MANY ATTEMPTS"
-              : "INVALID CREDENTIALS",
+              : response.status === 401
+              ? "INVALID CREDENTIALS"
+              : `SIGN-IN FAILED (${response.status})`,
           message:
             body?.detail || "Sign-in failed. Please try again.",
         });
@@ -557,10 +573,6 @@ function App({ auth, onSignOut }) {
   //   camera.stream  - IDLE / WAITING / LIVE / STALLED
   const [backendOnline, setBackendOnline] = useState(null);
 
-  // Per-camera live track intelligence from /api/cameras/{id}/tracks.
-  // Keyed by camera id so one camera's failure cannot blank another's.
-  const [tracksByCamera, setTracksByCamera] = useState({});
-
   const [loadingCamera, setLoadingCamera] = useState(null);
 
   const [apiError, setApiError] = useState("");
@@ -646,11 +658,6 @@ function App({ auth, onSignOut }) {
 
       setCameras(updatedCameras);
 
-      // Fed the list we just built rather than component state, which has
-      // not re-rendered yet at this point.
-      fetchTracks(updatedCameras);
-
-
       // Automatically select first camera
       setSelectedCamera((current) => {
         if (
@@ -704,54 +711,6 @@ function App({ auth, onSignOut }) {
       setSystemStatus(null);
       setBackendOnline(false);
     }
-  };
-
-  // ============================================================
-  // LIVE TRACK INTELLIGENCE
-  // ============================================================
-  //
-  // Only asked of cameras that are actually ONLINE. Polling a stopped
-  // camera for its people is a request that can only ever return nothing.
-
-  const fetchTracks = async (list) => {
-    const live = list.filter(
-      (camera) => camera.stats?.status === "ONLINE"
-    );
-
-    if (live.length === 0) {
-      setTracksByCamera({});
-      return;
-    }
-
-    const results = await Promise.all(
-      live.map(async (camera) => {
-        try {
-          const response = await apiFetch(
-            `${API}/api/cameras/${camera.id}/tracks`
-          );
-
-          if (!response.ok) {
-            return [camera.id, []];
-          }
-
-          const data = await response.json();
-
-          return [
-            camera.id,
-            Array.isArray(data.tracks)
-              ? data.tracks
-              : [],
-          ];
-        } catch {
-          // One camera failing must not blank the others.
-          return [camera.id, []];
-        }
-      })
-    );
-
-    setTracksByCamera(
-      Object.fromEntries(results)
-    );
   };
 
   // ============================================================
@@ -925,25 +884,6 @@ function App({ auth, onSignOut }) {
 
   const renderPage = () => {
     switch (activeTab) {
-      case "Live Monitoring":
-        return (
-          <LiveMonitoring
-            cameras={cameras}
-            selected={selected}
-            selectedCamera={selectedCamera}
-            setSelectedCamera={
-              setSelectedCamera
-            }
-            startCamera={startCamera}
-            stopCamera={stopCamera}
-            loadingCamera={
-              loadingCamera
-            }
-            tracksByCamera={tracksByCamera}
-            backendOnline={backendOnline}
-          />
-        );
-
       case "Alerts":
         return (
           <AlertsPage
@@ -1251,6 +1191,128 @@ function App({ auth, onSignOut }) {
 // DASHBOARD
 // ============================================================
 
+// ============================================================
+// DASHBOARD — THE COMMAND WALL
+// ============================================================
+//
+// Every panel on this page is fed by one of three sources, and they mean
+// different things. Mixing them up is the easiest way to make a dashboard
+// that lies, so each panel says which one it is reading:
+//
+//   LIVE      the running pipeline, right now, via /api/cameras/*/stats.
+//             Zero when a camera is stopped, because a stopped camera has
+//             no live state. This is the "4/4 ACTIVE, 6 PERSONS" row.
+//
+//   RECORDED  what the analysis concluded and wrote to the database, via
+//             /api/events. It survives a restart and it is the only
+//             honest source for a timeline.
+//
+//   EVIDENCE  the JPEGs the pipeline captured at the moment an incident
+//             fired, via /api/evidence. A picture of a real detection,
+//             not a stock image.
+//
+// Nothing on this page is generated in React. If a panel is empty it is
+// because the pipeline has not produced that thing yet, and it says so.
+
+
+/** How often the recorded feeds refresh. The live stats poll on their own
+ *  clock in App; these are database reads and do not need to be as quick. */
+const DASH_FEED_INTERVAL_MS = 4000;
+
+/** Threat levels in severity order, which is also the order they are
+ *  counted and displayed in. Kept here so the badge colours, the counts
+ *  and the legend cannot drift apart. */
+const THREAT_LEVELS = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+
+
+/**
+ * Recorded events and captured evidence, polled together.
+ *
+ * The three failure states are kept apart on purpose. A previous version
+ * of this project collapsed every non-200 into one "unavailable" message,
+ * and the result was that a perfectly healthy backend running an older
+ * build reported the same thing as a dead network. They are different
+ * problems with different fixes, so they get different words.
+ */
+function useRecordedFeed() {
+  const [events, setEvents] = useState([]);
+  const [evidence, setEvidence] = useState([]);
+  const [vehicles, setVehicles] = useState([]);
+  const [state, setState] = useState("loading");
+  const [problem, setProblem] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const load = async () => {
+      try {
+        const [eventsResponse, evidenceResponse, vehiclesResponse] =
+          await Promise.all([
+            apiFetch(`${API}/api/events?limit=60`),
+            apiFetch(`${API}/api/evidence?kind=crop&limit=12`),
+            apiFetch(`${API}/api/vehicles?limit=20&readable_only=false`),
+          ]);
+
+        if (cancelled) return;
+
+        // An HTTP error is the backend answering, not failing to answer.
+        // Say which route and which code, because "404 on /api/evidence"
+        // means the server predates the route and needs restarting, while
+        // "500" means it broke. Those are not the same message.
+        const failed = [
+          !eventsResponse.ok ? ["/api/events", eventsResponse.status] : null,
+          !evidenceResponse.ok
+            ? ["/api/evidence", evidenceResponse.status]
+            : null,
+          !vehiclesResponse.ok
+            ? ["/api/vehicles", vehiclesResponse.status]
+            : null,
+        ].filter(Boolean);
+
+        if (failed.length > 0) {
+          setState("http-error");
+          setProblem(
+            failed
+              .map(([route, code]) => `${route} returned ${code}`)
+              .join(", ")
+          );
+          return;
+        }
+
+        const [eventRows, evidenceRows, vehicleRows] = await Promise.all([
+          eventsResponse.json(),
+          evidenceResponse.json(),
+          vehiclesResponse.json(),
+        ]);
+
+        if (cancelled) return;
+
+        setEvents(Array.isArray(eventRows) ? eventRows : []);
+        setEvidence(Array.isArray(evidenceRows) ? evidenceRows : []);
+        setVehicles(Array.isArray(vehicleRows) ? vehicleRows : []);
+        setState("ready");
+        setProblem(null);
+      } catch (error) {
+        if (cancelled) return;
+        // The request never completed: the server is not listening, or
+        // the browser could not reach it at all.
+        setState("unreachable");
+        setProblem(String(error?.message || error));
+      }
+    };
+
+    load();
+    const timer = setInterval(load, DASH_FEED_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  return { events, evidence, vehicles, state, problem };
+}
+
+
 function Dashboard({
   cameras,
   selected,
@@ -1258,200 +1320,358 @@ function Dashboard({
   totalPersons,
   totalVehicles,
   totalAlerts,
-  totalDetections,
   runningCount,
   setSelectedCamera,
   startCamera,
   stopCamera,
   loadingCamera,
 }) {
-  // The selected camera's OWN live state. Every value is read from that
-  // camera's stats object, so CAM-02's numbers can never appear under
-  // CAM-01. A stopped camera reports zeros because the backend resets its
-  // live counters on stop.
-  const stats = selected?.stats;
-  const live = {
-    id: selected?.id || "NO CAMERA",
-    running: stats?.status === "ONLINE",
-    persons: Number(stats?.persons || 0),
-    vehicles: Number(stats?.vehicles || 0),
-    alerts: Number(stats?.alerts || 0),
-    detections: Number(stats?.detections || 0),
-  };
+  const { events, evidence, vehicles, state, problem } = useRecordedFeed();
+
+  // Counts by threat level, over exactly the events that are on screen.
+  // Not "all time" and not invented: the panel says what it counted, so
+  // the number and its meaning travel together.
+  const levelCounts = useMemo(() => {
+    const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+    for (const event of events) {
+      const level = String(event.threat_level || "").toUpperCase();
+      if (level in counts) counts[level] += 1;
+    }
+    return counts;
+  }, [events]);
+
+  // The badge counts every row shown beneath it. An earlier version
+  // excluded LOW, so the badge read 16 over a list that summed to 17 - a
+  // number disagreeing with the list directly below it.
+  const countedEvents = THREAT_LEVELS.reduce(
+    (total, level) => total + levelCounts[level],
+    0
+  );
+
+  // WHY THIS PANEL ASKS THE CAMERAS ABOUT ANPR
+  // ------------------------------------------
+  // An empty plate list has three completely different causes, and showing
+  // one message for all three hides the only one that needs acting on:
+  //
+  //   * no OCR engine is installed, so plates CANNOT be read;
+  //   * vehicles were seen but no plate has been captured yet;
+  //   * no vehicles have passed at all.
+  //
+  // The first of those was being reported as "NO VEHICLES TRACKED" while
+  // the backend log said "No OCR backend is available, so ANPR is switched
+  // off" six times over. The pipeline already knows; it reports its ANPR
+  // state on every camera's stats. So the panel asks, instead of guessing
+  // from an empty list.
+  const runningCameras = cameras.filter((camera) => camera.running);
+
+  const anprUnavailable =
+    runningCameras.length > 0 &&
+    runningCameras.every((camera) =>
+      /no ocr backend/i.test(String(camera.stats?.anpr || ""))
+    );
+
+  const vehiclesSeen = runningCameras.reduce(
+    (total, camera) => total + Number(camera.stats?.vehicles || 0),
+    0
+  );
 
   return (
-    <div className="page">
+    <div className="page wall">
 
-      <div className="page-intro">
+      {/* ==================================================
+          LEFT: the video wall, then the lower panels
+      ================================================== */}
 
-        <div>
+      <div className="wall-main">
 
-          <div className="section-label">
-            SURVEILLANCE OVERVIEW
+        <section className="panel">
+
+          <div className="panel-header">
+            <div className="panel-title">
+              <span className="panel-glyph">▣</span>
+              LIVE CAMERA FEEDS
+            </div>
+            <div className="panel-count">
+              {activeCameras} / {cameras.length} ONLINE
+            </div>
           </div>
 
-          <h2>
-            AI Command Dashboard
-          </h2>
+          <div className="feed-wall">
+            {cameras.map((camera) => (
+              <FeedTile
+                key={camera.id}
+                camera={camera}
+                selected={selected?.id === camera.id}
+                loading={loadingCamera === camera.id}
+                onSelect={() => setSelectedCamera(camera.id)}
+                onStart={() => startCamera(camera.id)}
+                onStop={() => stopCamera(camera.id)}
+              />
+            ))}
+          </div>
 
-          <p>
-            Real-time monitoring of the
-            intelligent border surveillance
-            network.
-          </p>
+        </section>
 
-        </div>
+        <div className="wall-lower">
 
-      </div>
-
-      {/* ======================================================
-          STAT CARDS
-      ====================================================== */}
-
-      <div className="dashboard-stats">
-
-        <DashboardStat
-          label="ACTIVE CAMERAS"
-          value={activeCameras}
-          detail={`${cameras.length} configured`}
-        />
-
-        {/* These three read the SELECTED camera, not the fleet. Each
-            camera's live state is its own; the fleet total is kept on the
-            sub-line so both are visible and neither is mistaken for the
-            other. A camera that is not running reads zero. */}
-
-        <DashboardStat
-          label={`PERSONS — ${live.id}`}
-          value={live.persons}
-          detail={
-            live.running
-              ? `${totalPersons} across ${runningCount} running`
-              : "camera not running"
-          }
-        />
-
-        <DashboardStat
-          label={`VEHICLES — ${live.id}`}
-          value={live.vehicles}
-          detail={
-            live.running
-              ? `${totalVehicles} across ${runningCount} running`
-              : "camera not running"
-          }
-        />
-
-        <DashboardStat
-          label={`ALERTS — ${live.id}`}
-          value={live.alerts}
-          detail={
-            live.running
-              ? `${live.detections} detections this run`
-              : "camera not running"
-          }
-        />
-
-      </div>
-
-      {/* ======================================================
-          CAMERA NETWORK
-      ====================================================== */}
-
-      <section className="panel">
-
-        <div className="panel-header">
-
-          <div>
-
-            <div className="section-label">
-              SURVEILLANCE NETWORK
+          {/* ---- threat level tally ---- */}
+          <section className="panel">
+            <div className="panel-header">
+              <div className="panel-title">
+                <span className="panel-glyph alarm">⚠</span>
+                ALERTS &amp; INCIDENTS
+              </div>
+              <div className="panel-count">{countedEvents}</div>
             </div>
 
-            <h3>
-              Camera Nodes
-            </h3>
+            <div className="level-tally">
+              {THREAT_LEVELS.map((level) => (
+                <div className="level-row" key={level}>
+                  <span className={`level-dot ${level.toLowerCase()}`} />
+                  <span className="level-name">
+                    {level === "CRITICAL"
+                      ? "Critical"
+                      : level === "HIGH"
+                        ? "High Threat"
+                        : level === "MEDIUM"
+                          ? "Medium Threat"
+                          : "Low Threat"}
+                  </span>
+                  <strong className="level-count">
+                    {levelCounts[level]}
+                  </strong>
+                </div>
+              ))}
+            </div>
 
-          </div>
+            {/* The scope, stated. Without this the numbers look like
+                all-time totals and quietly disagree with every other
+                count on the page. */}
+            <div className="panel-foot">
+              across the {events.length} most recent recorded events
+            </div>
+          </section>
 
-          <div className="panel-count">
-            {activeCameras} ACTIVE /{" "}
-            {cameras.length} TOTAL
-          </div>
+          {/* ---- captured snapshots ---- */}
+          <section className="panel">
+            <div className="panel-header">
+              <div className="panel-title">
+                <span className="panel-glyph">◨</span>
+                RECENT DETECTIONS
+              </div>
+            </div>
+
+            <FeedState state={state} problem={problem}
+              empty={evidence.length === 0}
+              emptyTitle="NO SNAPSHOTS CAPTURED"
+              emptyBody="The pipeline saves an image when an incident reaches MEDIUM or above. None have fired yet.">
+              <div className="thumb-strip">
+                {evidence.map((item) => (
+                  <EvidenceThumb key={item.id} item={item} />
+                ))}
+              </div>
+            </FeedState>
+          </section>
+
+          {/* ---- timeline ---- */}
+          <section className="panel">
+            <div className="panel-header">
+              <div className="panel-title">
+                <span className="panel-glyph">☰</span>
+                EVENT TIMELINE
+              </div>
+            </div>
+
+            <FeedState state={state} problem={problem}
+              empty={events.length === 0}
+              emptyTitle="NO EVENTS RECORDED"
+              emptyBody="Start a camera. Events appear here as the analysis concludes them.">
+              <ol className="timeline">
+                {events.slice(0, 12).map((event) => (
+                  <TimelineRow
+                    key={`${event.incident_id}-${event.ts}`}
+                    event={event}
+                  />
+                ))}
+              </ol>
+            </FeedState>
+          </section>
 
         </div>
 
-        <div className="camera-grid">
+      </div>
 
-          {cameras.map((camera) => (
+      {/* ==================================================
+          RIGHT RAIL
+      ================================================== */}
 
-            <CameraCard
-              key={camera.id}
-              camera={camera}
-              selected={
-                selected?.id === camera.id
-              }
-              onSelect={() =>
-                setSelectedCamera(
-                  camera.id
-                )
-              }
-              onStart={() =>
-                startCamera(
-                  camera.id
-                )
-              }
-              onStop={() =>
-                stopCamera(
-                  camera.id
-                )
-              }
-              loading={
-                loadingCamera ===
-                camera.id
-              }
+      <aside className="wall-rail">
+
+        <section className="panel">
+          <div className="panel-header">
+            <div className="panel-title">
+              <span className="panel-glyph alarm">⚠</span>
+              CAMERA STATUS
+            </div>
+          </div>
+
+          <div className="status-list">
+            {cameras.map((camera) => (
+              <button
+                type="button"
+                key={camera.id}
+                className={
+                  "status-row" +
+                  (selected?.id === camera.id ? " is-selected" : "")
+                }
+                onClick={() => setSelectedCamera(camera.id)}
+              >
+                <span
+                  className={
+                    "status-dot" +
+                    (camera.running
+                      ? " online"
+                      : camera.starting
+                        ? " starting"
+                        : " offline")
+                  }
+                />
+                <span className="status-id">{camera.id}</span>
+                <span className="status-place">
+                  {camera.location || camera.sector || ""}
+                </span>
+                <span
+                  className={
+                    "status-state" + (camera.running ? " online" : "")
+                  }
+                >
+                  {camera.running
+                    ? "LIVE"
+                    : camera.starting
+                      ? "STARTING"
+                      : "OFFLINE"}
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <div className="panel-title">
+              <span className="panel-glyph">▤</span>
+              QUICK STATS
+            </div>
+          </div>
+
+          {/* All four read the LIVE pipeline and sum only cameras that are
+              actually running. A stopped camera contributes nothing, so
+              "0 cameras active, 3 persons" cannot appear. */}
+          <div className="quick-stats">
+            <QuickStat
+              glyph="▣"
+              label="ACTIVE CAMERAS"
+              value={`${activeCameras} / ${cameras.length}`}
             />
-
-          ))}
-
-        </div>
-
-      </section>
-
-      {/* ======================================================
-          LIVE CAMERA
-      ====================================================== */}
-
-      <section className="panel">
-
-        <div className="panel-header">
-
-          <div>
-
-            <div className="section-label">
-              LIVE FEED
-            </div>
-
-            <h3>
-              {selected?.name ||
-                "No Camera Selected"}
-            </h3>
-
+            <QuickStat glyph="◉" label="PERSONS" value={totalPersons} />
+            <QuickStat glyph="▭" label="VEHICLES" value={totalVehicles} />
+            <QuickStat
+              glyph="⚠"
+              label="ALERTS"
+              value={totalAlerts}
+              tone={totalAlerts > 0 ? "alarm" : undefined}
+            />
           </div>
 
-          {selected?.running && (
-            <div className="live-badge">
-              <span className="pulse-dot" />
-              LIVE
+          <div className="panel-foot">
+            live, from {runningCount} running camera
+            {runningCount === 1 ? "" : "s"}
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <div className="panel-title">
+              <span className="panel-glyph">▭</span>
+              VEHICLE PLATES (ANPR)
             </div>
+            <div className={"panel-count" + (anprUnavailable ? " warn" : "")}>
+              {anprUnavailable
+                ? "ENGINE OFF"
+                : `${vehicles.filter((v) => v.readable).length} / ${vehicles.length} READ`}
+            </div>
+          </div>
+
+          {anprUnavailable ? (
+            // Not an empty state. The system cannot do this job at all
+            // right now, and the fix is one command, so it says both.
+            <div className="feed-note error">
+              <strong>ANPR UNAVAILABLE</strong>
+              <span>
+                No OCR engine is installed, so number plates cannot be
+                read. Detection, tracking and threat analysis are all
+                unaffected and still running.
+              </span>
+              {/* The bundled installer, not a pip command. Everything it
+                  needs already ships with the project, so this works
+                  with no internet - which a bare `pip install` does not. */}
+              <code>./scripts/enable_anpr.sh</code>
+            </div>
+          ) : (
+            <FeedState state={state} problem={problem}
+              empty={vehicles.length === 0}
+              emptyTitle={
+                vehiclesSeen > 0
+                  ? "NO PLATE CAPTURED YET"
+                  : "NO VEHICLES TRACKED"
+              }
+              emptyBody={
+                vehiclesSeen > 0
+                  ? `${vehiclesSeen} vehicle${vehiclesSeen === 1 ? "" : "s"} ` +
+                    "in view. A plate is only attempted once a vehicle is " +
+                    "close enough for one to be legible."
+                  : "Start a camera that sees vehicles. Plates are read as they pass."
+              }>
+              <div className="plate-list">
+                {vehicles.map((vehicle) => (
+                  <PlateRow
+                    key={`${vehicle.camera_id}-${vehicle.track_id}-${vehicle.ts}`}
+                    vehicle={vehicle}
+                  />
+                ))}
+              </div>
+            </FeedState>
           )}
 
-        </div>
+          <div className="panel-foot">
+            state and district decoded from the registration prefix
+          </div>
+        </section>
 
-        <CameraFeed
-          camera={selected}
-        />
+        <section className="panel rail-events">
+          <div className="panel-header">
+            <div className="panel-title">
+              <span className="panel-glyph">◈</span>
+              LIVE THREAT EVENTS
+            </div>
+          </div>
 
-      </section>
+          <FeedState state={state} problem={problem}
+            empty={events.length === 0}
+            emptyTitle="NO EVENTS RECORDED"
+            emptyBody="Nothing has been detected and concluded yet.">
+            <div className="threat-events">
+              {events.slice(0, 8).map((event) => (
+                <ThreatEventRow
+                  key={`${event.incident_id}-${event.ts}`}
+                  event={event}
+                />
+              ))}
+            </div>
+          </FeedState>
+        </section>
+
+      </aside>
 
     </div>
   );
@@ -1459,31 +1679,388 @@ function Dashboard({
 
 
 // ============================================================
-// DASHBOARD STAT
+// ONE VEHICLE, ITS PLATE, AND WHERE IT IS REGISTERED
 // ============================================================
 
-function DashboardStat({
-  label,
-  value,
-  detail,
-}) {
+function PlateRow({ vehicle }) {
+  // A vehicle whose plate could not be read is still shown. On a
+  // checkpoint camera "a vehicle passed and we did not get its plate" is
+  // a finding an operator needs, not a blank to be tidied away.
+  if (!vehicle.readable) {
+    return (
+      <div className="plate-row is-unread">
+        <div className="plate-shot empty">▭</div>
+        <div className="plate-body">
+          <strong className="plate-text unread">PLATE NOT READ</strong>
+          <span className="plate-origin">
+            {vehicle.attempts} attempt{vehicle.attempts === 1 ? "" : "s"},
+            none legible
+          </span>
+          <span className="plate-meta">
+            {vehicle.camera_id} · {vehicle.time}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="stat-card">
+    <div className="plate-row">
+      {vehicle.image_url ? (
+        <img
+          className="plate-shot"
+          src={`${API}${vehicle.image_url}?token=${encodeURIComponent(readToken() || "")}`}
+          alt={`Plate crop for ${vehicle.plate_text}`}
+          loading="lazy"
+        />
+      ) : (
+        <div className="plate-shot empty">▭</div>
+      )}
 
-      <span className="stat-label">
-        {label}
-      </span>
+      <div className="plate-body">
+        <div className="plate-line">
+          <strong className="plate-text">{vehicle.plate_text}</strong>
 
-      <strong className="stat-value">
-        {value}
-      </strong>
+          {/* In India the plate's background colour is a legal class, not
+              decoration: yellow means the vehicle is for hire. Shown only
+              when the classifier was sure - an unreadable or shadowed
+              crop carries no chip rather than a guessed class. */}
+          {vehicle.vehicle_class && (
+            <span
+              className={
+                "plate-class " +
+                String(vehicle.plate_colour || "").toLowerCase()
+              }
+              title={vehicle.vehicle_class_note || ""}
+            >
+              {vehicle.vehicle_class}
+            </span>
+          )}
+        </div>
 
-      <small className="stat-detail">
-        {detail}
-      </small>
+        {/* The decoded origin. District and state are shown as separate
+            pieces rather than as one sentence, because the rail is narrow
+            and a single line truncated to "Shimla Urban (tourist buses &
+            ta..." hides the state, which is the part that always exists.
+
+            Register entries carry a qualifier in brackets - the RTO's own
+            wording, such as "(tourist buses & taxis)". It is trimmed off
+            the compact line and kept in the tooltip, so nothing is
+            invented and nothing is lost.
+
+            When the district is not in the table the backend's own
+            sentence is shown verbatim instead, so a partial answer reads
+            as partial rather than as a blank. */}
+        {vehicle.district_known ? (
+          <span className="plate-origin is-full" title={vehicle.origin}>
+            <span className="plate-district">
+              {String(vehicle.district).split(" (")[0]}
+            </span>
+            <span className="plate-state">{vehicle.state}</span>
+          </span>
+        ) : (
+          <span className="plate-origin" title={vehicle.origin}>
+            {vehicle.origin}
+          </span>
+        )}
+
+        <div className="plate-meta">
+          <span>{vehicle.camera_id}</span>
+          <span>{vehicle.time}</span>
+          {/* How the answer was reached, so a contested plate looks
+              contested rather than certain. */}
+          <span className="plate-reads">
+            {vehicle.reads}/{vehicle.attempts} reads
+          </span>
+          <span
+            className={
+              "plate-conf" + (vehicle.validated ? " ok" : "")
+            }
+          >
+            {vehicle.validated ? "FORMAT OK" : "UNVERIFIED"}{" "}
+            {Math.round((vehicle.confidence || 0) * 100)}%
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// ONE CAMERA IN THE WALL
+// ============================================================
+
+function FeedTile({
+  camera,
+  selected,
+  loading,
+  onSelect,
+  onStart,
+  onStop,
+}) {
+  const stats = camera.stats || {};
+
+  return (
+    <div
+      className={"feed-tile" + (selected ? " is-selected" : "")}
+      onClick={onSelect}
+    >
+
+      <div className="tile-head">
+        <div className="tile-id">
+          {camera.id}
+          <span
+            className={
+              "tile-badge" +
+              (camera.running
+                ? " live"
+                : camera.starting
+                  ? " starting"
+                  : "")
+            }
+          >
+            {camera.running
+              ? "● LIVE"
+              : camera.starting
+                ? "● STARTING"
+                : "● OFFLINE"}
+          </span>
+        </div>
+
+        <button
+          type="button"
+          className={"tile-action" + (camera.running ? " stop" : "")}
+          disabled={loading}
+          onClick={(clickEvent) => {
+            // The tile itself selects the camera; the button must not do
+            // that too, or starting a camera would also move the
+            // selection under the operator's hands.
+            clickEvent.stopPropagation();
+            camera.running ? onStop() : onStart();
+          }}
+        >
+          {loading ? "···" : camera.running ? "STOP" : "START"}
+        </button>
+      </div>
+
+      <div className="tile-name">{camera.name || camera.id}</div>
+
+      <div className="tile-view">
+        {camera.running ? (
+          // The boxes, person numbers, behaviour and threat labels are
+          // drawn into the frame by core/annotator.py before it leaves
+          // the backend. React never draws an overlay, so what is on
+          // screen is exactly what the analysis saw.
+          <img
+            src={streamUrl(camera.id)}
+            alt={`${camera.id} live feed with detection overlay`}
+          />
+        ) : (
+          <div className="tile-dark">
+            <span className="tile-dark-glyph">
+              {camera.starting ? "◌" : "▣"}
+            </span>
+            <strong>
+              {camera.starting ? "CONNECTING" : "OFFLINE"}
+            </strong>
+            <span className="tile-dark-hint">
+              {camera.starting
+                ? "Opening the video source"
+                : "Press START to begin analysis"}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Live counters for THIS camera. A stopped camera shows dashes
+          rather than zeros, because "no data" and "counted zero" are
+          different claims. */}
+      <div className="tile-stats">
+        <span>
+          PERSONS{" "}
+          <strong>{camera.running ? Number(stats.persons || 0) : "--"}</strong>
+        </span>
+        <span>
+          VEHICLES{" "}
+          <strong>{camera.running ? Number(stats.vehicles || 0) : "--"}</strong>
+        </span>
+        <span className={camera.running && stats.alerts > 0 ? "alarm" : ""}>
+          ALERTS{" "}
+          <strong>{camera.running ? Number(stats.alerts || 0) : "--"}</strong>
+        </span>
+      </div>
 
     </div>
   );
+}
+
+
+// ============================================================
+// SMALL PARTS
+// ============================================================
+
+function QuickStat({ glyph, label, value, tone }) {
+  return (
+    <div className={"quick-stat" + (tone ? ` ${tone}` : "")}>
+      <span className="quick-glyph">{glyph}</span>
+      <span className="quick-label">{label}</span>
+      <strong className="quick-value">{value}</strong>
+    </div>
+  );
+}
+
+
+function ThreatBadge({ level }) {
+  const text = String(level || "").toUpperCase();
+  if (!text) return null;
+  return (
+    <span className={`threat-badge ${text.toLowerCase()}`}>{text}</span>
+  );
+}
+
+
+/** The label for a person or vehicle, as the operator refers to it. */
+function subjectLabel(event) {
+  const type = String(event.object_type || "object");
+  const noun = type.charAt(0).toUpperCase() + type.slice(1);
+  return event.track_id ? `${noun} #${event.track_id}` : noun;
+}
+
+
+/** What happened, in the pipeline's own words.
+ *
+ *  `headline` comes from the incident type; `behaviour` from the
+ *  classifier. Neither is invented here. When the classifier reached no
+ *  conclusion the behaviour is simply left out rather than padded with
+ *  "unknown", which would read as a finding. */
+function describeEvent(event) {
+  const parts = [];
+  if (event.headline) parts.push(event.headline);
+  if (event.behaviour) {
+    parts.push(String(event.behaviour).toLowerCase().replace(/_/g, " "));
+  }
+  return parts.join(" — ") || "Recorded event";
+}
+
+
+function ThreatEventRow({ event }) {
+  return (
+    <div className="threat-event">
+      <span className={`event-tick ${String(event.threat_level || "")
+        .toLowerCase()}`} />
+      <span className="event-time">{event.time}</span>
+      <ThreatBadge level={event.threat_level} />
+      <div className="event-body">
+        <strong>{subjectLabel(event)}</strong>
+        <span>{describeEvent(event)}</span>
+      </div>
+    </div>
+  );
+}
+
+
+function TimelineRow({ event }) {
+  return (
+    <li className="timeline-row">
+      <span className={`timeline-tick ${String(event.threat_level || "")
+        .toLowerCase()}`} />
+      <span className="timeline-when">
+        <strong>{event.time}</strong>
+        {/* The date is shown as well as the time. A timeline that shows
+            only a clock reads as "today" even when the newest entry is
+            from last week. */}
+        <small>{event.date}</small>
+      </span>
+      <span className="timeline-camera">{event.camera_id}</span>
+      <span className="timeline-subject">{subjectLabel(event)}</span>
+      <span className="timeline-what">{describeEvent(event)}</span>
+      <ThreatBadge level={event.threat_level} />
+    </li>
+  );
+}
+
+
+function EvidenceThumb({ item }) {
+  return (
+    <figure className="thumb">
+      {/* The token goes in the query because a browser will not put an
+          Authorization header on an <img> request. Same trade-off, and
+          same reasoning, as the camera stream. */}
+      <img
+        src={`${API}${item.image_url}?token=${encodeURIComponent(readToken() || "")}`}
+        alt={`${subjectLabel(item)} captured at ${item.time}`}
+        loading="lazy"
+      />
+      <figcaption>
+        <strong>{subjectLabel(item)}</strong>
+        <span>{item.headline}</span>
+        <div className="thumb-foot">
+          <ThreatBadge level={item.threat_level} />
+          <small>{item.time}</small>
+        </div>
+        <small className="thumb-cam">{item.camera_id} · {item.date}</small>
+      </figcaption>
+    </figure>
+  );
+}
+
+
+/**
+ * Loading, failure and emptiness, told apart.
+ *
+ * "Nothing has happened yet" is not a failure and must never be shown as
+ * one, and a backend that answered with an error is not the same as a
+ * backend that could not be reached. Each gets its own words, so the
+ * message points at the actual fix.
+ */
+function FeedState({
+  state,
+  problem,
+  empty,
+  emptyTitle,
+  emptyBody,
+  children,
+}) {
+  if (state === "loading") {
+    return <div className="feed-note">Loading…</div>;
+  }
+
+  if (state === "unreachable") {
+    return (
+      <div className="feed-note error">
+        <strong>BACKEND UNREACHABLE</strong>
+        <span>
+          The request did not complete. The server may have stopped.
+        </span>
+        {problem && <code>{problem}</code>}
+      </div>
+    );
+  }
+
+  if (state === "http-error") {
+    return (
+      <div className="feed-note error">
+        <strong>BACKEND ERROR</strong>
+        <span>
+          The server answered, but with an error. A 404 here means it is
+          running an older build and needs restarting.
+        </span>
+        {problem && <code>{problem}</code>}
+      </div>
+    );
+  }
+
+  if (empty) {
+    return (
+      <div className="feed-note">
+        <strong>{emptyTitle}</strong>
+        <span>{emptyBody}</span>
+      </div>
+    );
+  }
+
+  return children;
 }
 
 
@@ -1681,588 +2258,6 @@ function CameraManagement({
 
       </div>
 
-    </div>
-  );
-}
-
-
-// ============================================================
-// LIVE MONITORING
-// ============================================================
-
-function LiveMonitoring({
-  cameras,
-  selected,
-  selectedCamera,
-  setSelectedCamera,
-  startCamera,
-  stopCamera,
-  loadingCamera,
-  tracksByCamera,
-  backendOnline,
-}) {
-  // Chrome allows roughly six simultaneous connections per origin over
-  // HTTP/1.1, and an MJPEG feed holds one open permanently. Past that the
-  // ordinary polling requests queue behind the video and never run, which
-  // looks exactly like the backend having died. Four tiles leaves headroom
-  // for the stats and health polls.
-  const MAX_TILE_STREAMS = 4;
-
-  const live = cameras.filter(
-    (camera) => camera.stats?.status === "ONLINE"
-  );
-
-  const streaming = live.slice(0, MAX_TILE_STREAMS);
-
-  const [expanded, setExpanded] = useState(null);
-
-  const expandedCamera = cameras.find(
-    (camera) => camera.id === expanded
-  );
-
-  if (expandedCamera) {
-    return (
-      <ExpandedCamera
-        camera={expandedCamera}
-        tracks={tracksByCamera[expandedCamera.id] || []}
-        onClose={() => setExpanded(null)}
-        startCamera={startCamera}
-        stopCamera={stopCamera}
-        loadingCamera={loadingCamera}
-      />
-    );
-  }
-
-  return (
-    <div className="page">
-
-      <div className="wall-toolbar">
-
-        <div>
-          <div className="section-label">
-            REAL-TIME SURVEILLANCE
-          </div>
-          <h2>Surveillance Wall</h2>
-        </div>
-
-        <div className="wall-counts">
-          <span className="wall-count">
-            <strong>{live.length}</strong> LIVE
-          </span>
-          <span className="wall-count muted">
-            <strong>{cameras.length}</strong> CONFIGURED
-          </span>
-        </div>
-
-      </div>
-
-      {live.length > MAX_TILE_STREAMS && (
-        <div className="wall-notice">
-          Showing video for the first {MAX_TILE_STREAMS} live cameras.
-          A browser holds only about six connections per origin and each
-          feed keeps one open, so beyond this the status polling would
-          stall behind the video.
-        </div>
-      )}
-
-      {cameras.length === 0 && (
-        <div className="wall-empty">
-          {backendOnline === false
-            ? "No camera list. The backend is not answering."
-            : "No cameras configured."}
-        </div>
-      )}
-
-      <div className="camera-wall">
-        {cameras.map((camera) => (
-          <WallTile
-            key={camera.id}
-            camera={camera}
-            tracks={tracksByCamera[camera.id] || []}
-            streamAllowed={streaming.some(
-              (c) => c.id === camera.id
-            )}
-            onExpand={() => {
-              setSelectedCamera(camera.id);
-              setExpanded(camera.id);
-            }}
-            onStart={() => startCamera(camera.id)}
-            onStop={() => stopCamera(camera.id)}
-            loading={loadingCamera === camera.id}
-          />
-        ))}
-      </div>
-
-      <LiveEventFeed cameras={cameras} />
-
-    </div>
-  );
-}
-
-
-// ============================================================
-// LIVE EVENT FEED
-// ============================================================
-//
-// The same events the Detection Logs page shows, from the same endpoint,
-// while the cameras are still running.
-//
-// This is the point of having one event source. The pipeline raises an
-// incident; that incident sets the threat level drawn on the person's
-// bounding box, becomes the alert the operator is shown, and is written to
-// the database. This panel and Detection Logs are two readings of that one
-// record, not two systems that happen to agree. Nothing here is generated
-// in React - remove the backend and this panel is empty, as it should be.
-
-function LiveEventFeed({ cameras }) {
-  const [events, setEvents] = useState([]);
-
-  const sessions = useMemo(
-    () =>
-      cameras
-        .map(
-          (item) =>
-            item.stats?.session_id ?? item.stats?.final?.session_id ?? null
-        )
-        .filter((value) => value != null)
-        .join(","),
-    [cameras]
-  );
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const load = async () => {
-      try {
-        const response = await apiFetch(
-          `${API}/api/events?session_ids=${encodeURIComponent(
-            sessions
-          )}&limit=12`
-        );
-        if (!response.ok) return;
-        const data = await response.json();
-        if (!cancelled) setEvents(Array.isArray(data) ? data : []);
-      } catch {
-        // The wall already reports backend state; a silent feed here is
-        // better than a second error banner saying the same thing.
-      }
-    };
-
-    load();
-    const timer = setInterval(load, 3000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [sessions]);
-
-  if (events.length === 0) return null;
-
-  return (
-    <section className="panel live-feed">
-      <div className="panel-header">
-        <h3>Live Event Feed</h3>
-        <span className="panel-count">
-          SAME RECORDS AS DETECTION LOGS
-        </span>
-      </div>
-      <div className="log-timeline">
-        {events.map((event) => (
-          <div className="log-event" key={event.incident_id}>
-            <div className="log-event-head log-event-static">
-              <span className="log-event-time">{event.time}</span>
-              <span
-                className={`log-level ${threatClass(event.threat_level)}`}
-              >
-                {event.threat_level || "UNKNOWN"}
-              </span>
-              <span className="log-event-cam">{event.camera_id}</span>
-              <span className="log-event-actor">
-                {event.object_label || "UNTRACKED"}
-              </span>
-              <span className="log-event-what">{event.headline}</span>
-            </div>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-
-// ============================================================
-// CAMERA STATUS PILL
-// ============================================================
-//
-// Camera state and stream state are different questions and get
-// different pills. A camera can be ONLINE and its picture not yet
-// flowing; showing one value for both is how "it says online but I see
-// nothing" happens.
-
-function StatusPill({ status }) {
-  const value = status || "UNKNOWN";
-  return (
-    <span className={`pill pill-${value.toLowerCase()}`}>
-      {(value === "ONLINE" || value === "LIVE") && (
-        <span className="pulse-dot" />
-      )}
-      {value}
-    </span>
-  );
-}
-
-
-// ============================================================
-// ONE WALL TILE
-// ============================================================
-
-function WallTile({
-  camera,
-  tracks,
-  streamAllowed,
-  onExpand,
-  onStart,
-  onStop,
-  loading,
-}) {
-  // Camera control is a Super Admin action. The button is hidden rather
-  // than disabled for a normal user: the backend will refuse the request
-  // either way, and an interface full of dead controls reads as broken
-  // rather than restricted.
-  const { canControl } = useAccess();
-
-  const stats = camera.stats || EMPTY_STATS;
-  const status = stats.status || "OFFLINE";
-  const stream = stats.stream || "IDLE";
-  const online = status === "ONLINE";
-
-  // The <img> is mounted ONLY for a camera the backend says is running.
-  // Loading a stream must never be what starts a camera; the lifecycle
-  // belongs to the backend and the Start button.
-  const showVideo = online && streamAllowed;
-
-  return (
-    <article
-      className={`wall-tile ${online ? "is-live" : "is-idle"}`}
-      onClick={onExpand}
-    >
-
-      <header className="tile-head">
-        <div className="tile-id">
-          <strong>{camera.id}</strong>
-          <span>{camera.location || "—"}</span>
-        </div>
-        <StatusPill status={status} />
-      </header>
-
-      <div className="tile-video">
-        {showVideo ? (
-          <img
-            src={streamUrl(camera.id)}
-            alt={`${camera.id} live feed`}
-          />
-        ) : (
-          <div className="tile-placeholder">
-            <span className="tile-placeholder-icon">
-              {status === "ERROR" ? "!" : "\u25cc"}
-            </span>
-            <span>
-              {status === "ERROR"
-                ? stats.error || "CAMERA ERROR"
-                : online
-                ? "STREAM CAPPED"
-                : status}
-            </span>
-          </div>
-        )}
-
-        {showVideo && stream !== "LIVE" && (
-          <div className="tile-stream-state">{stream}</div>
-        )}
-
-        {tracks.length > 0 && (
-          <div className="tile-tracks">
-            {tracks.slice(0, 3).map((track) => (
-              <TrackChip
-                key={track.track_id}
-                track={track}
-              />
-            ))}
-            {tracks.length > 3 && (
-              <span className="track-chip more">
-                +{tracks.length - 3}
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-
-      <footer className="tile-foot">
-        <span>
-          PERSONS <strong>{stats.persons ?? 0}</strong>
-        </span>
-        <span>
-          FPS <strong>{Number(stats.fps || 0).toFixed(1)}</strong>
-        </span>
-        <span>
-          {stats.inference_ms
-            ? `${Math.round(stats.inference_ms)} MS`
-            : "— MS"}
-        </span>
-
-        <button
-          className={online ? "stop-btn tiny" : "start-btn tiny"}
-          disabled={loading}
-          onClick={(event) => {
-            event.stopPropagation();
-            online ? onStop() : onStart();
-          }}
-        >
-          {loading
-            ? "..."
-            : online
-            ? "STOP"
-            : "START"}
-        </button>
-      </footer>
-
-    </article>
-  );
-}
-
-
-// ============================================================
-// PERSON CHIP
-// ============================================================
-//
-// Every value comes from /api/cameras/{id}/tracks. A field the pipeline
-// has not concluded shows its own honest state rather than a default:
-// behaviour reads UNKNOWN while the movement layer is still gathering
-// pose samples, and threat is absent entirely until the ThreatEngine has
-// actually scored that person.
-
-function TrackChip({ track }) {
-  const threat = track.threat_level;
-  const behaviour =
-    track.behaviour && track.behaviour !== "UNKNOWN"
-      ? track.behaviour
-      : track.pose_status === "UNAVAILABLE"
-      ? "NO POSE"
-      : "ANALYSING";
-
-  return (
-    <span
-      className={`track-chip ${
-        threat ? `threat-${threat.toLowerCase()}` : ""
-      }`}
-    >
-      <b>#{String(track.track_id).padStart(2, "0")}</b>
-      {behaviour}
-      {threat && <i>{threat}</i>}
-    </span>
-  );
-}
-
-
-// ============================================================
-// EXPANDED CAMERA
-// ============================================================
-
-function ExpandedCamera({
-  camera,
-  tracks,
-  onClose,
-  startCamera,
-  stopCamera,
-  loadingCamera,
-}) {
-  // Camera control is a Super Admin action. The button is hidden rather
-  // than disabled for a normal user: the backend will refuse the request
-  // either way, and an interface full of dead controls reads as broken
-  // rather than restricted.
-  const { canControl } = useAccess();
-
-  const stats = camera.stats || EMPTY_STATS;
-  const online = stats.status === "ONLINE";
-
-  const [focus, setFocus] = useState(null);
-
-  const focused =
-    tracks.find((t) => t.track_id === focus) || tracks[0] || null;
-
-  return (
-    <div className="page">
-
-      <div className="wall-toolbar">
-        <div>
-          <div className="section-label">
-            {camera.location || "CAMERA"}
-          </div>
-          <h2>
-            {camera.id} — {camera.name}
-          </h2>
-        </div>
-
-        <div className="wall-counts">
-          <StatusPill status={stats.status} />
-          <StatusPill status={stats.stream} />
-          <button className="ghost-btn" onClick={onClose}>
-            BACK TO WALL
-          </button>
-        </div>
-      </div>
-
-      <div className="expanded-layout">
-
-        <section className="panel expanded-feed">
-          <CameraFeed camera={camera} />
-
-          <div className="camera-control-row">
-            {!canControl ? (
-              <span className="control-locked">
-                Camera control requires Super Admin
-              </span>
-            ) : online ? (
-              <button
-                className="stop-btn"
-                onClick={() => stopCamera(camera.id)}
-                disabled={loadingCamera === camera.id}
-              >
-                {loadingCamera === camera.id
-                  ? "STOPPING..."
-                  : "STOP CAMERA"}
-              </button>
-            ) : (
-              <button
-                className="start-btn"
-                onClick={() => startCamera(camera.id)}
-                disabled={loadingCamera === camera.id}
-              >
-                {loadingCamera === camera.id
-                  ? "STARTING..."
-                  : "START CAMERA"}
-              </button>
-            )}
-          </div>
-        </section>
-
-        <section className="panel track-panel">
-          <div className="panel-header">
-            <div>
-              <div className="section-label">
-                TRACK INTELLIGENCE
-              </div>
-              <h3>
-                {tracks.length}{" "}
-                {tracks.length === 1 ? "PERSON" : "PEOPLE"} IN VIEW
-              </h3>
-            </div>
-          </div>
-
-          {tracks.length === 0 && (
-            <div className="track-empty">
-              {online
-                ? "No confirmed person tracks right now."
-                : "Camera is not running."}
-            </div>
-          )}
-
-          <div className="track-list">
-            {tracks.map((track) => (
-              <button
-                key={track.track_id}
-                className={`track-row ${
-                  focused && focused.track_id === track.track_id
-                    ? "is-focused"
-                    : ""
-                }`}
-                onClick={() => setFocus(track.track_id)}
-              >
-                <TrackChip track={track} />
-                <span className="track-row-meta">
-                  {track.direction || "STATIONARY"}
-                </span>
-              </button>
-            ))}
-          </div>
-
-          {focused && <TrackDetail track={focused} />}
-        </section>
-
-      </div>
-
-    </div>
-  );
-}
-
-
-// ============================================================
-// TRACK DETAIL
-// ============================================================
-//
-// Only fields the backend actually sends. Anything the pipeline has not
-// established renders as its own state word, never as a plausible value.
-
-function TrackDetail({ track }) {
-  const rows = [
-    ["Track ID", `#${track.track_id}`],
-    ["Detection", `person ${track.detection_confidence ?? "—"}`],
-    [
-      "Behaviour",
-      track.behaviour === "UNKNOWN"
-        ? "UNKNOWN"
-        : `${track.behaviour} ${
-            track.confidence ? `(${Math.round(track.confidence * 100)}%)` : ""
-          }`,
-    ],
-    ["Movement", track.direction || "STATIONARY"],
-    [
-      "Pose",
-      track.pose_status === "TRACKED"
-        ? `TRACKED (${track.keypoints}/17 keypoints)`
-        : track.pose_status,
-    ],
-    ["Posture", track.posture || "NOT AVAILABLE"],
-    [
-      "Boundary",
-      track.boundary_state === "NONE"
-        ? "NONE"
-        : `${track.boundary_state}${
-            track.boundary_line ? ` — ${track.boundary_line}` : ""
-          }`,
-    ],
-    ["Zone", track.zone || "NONE"],
-    ["Crossings", track.crossings ?? 0],
-    ["Anomaly", track.anomaly_status || "NOT AVAILABLE"],
-    [
-      "Threat",
-      track.threat_level
-        ? `${track.threat_level} (${track.threat_score})`
-        : "NOT ASSESSED",
-    ],
-  ];
-
-  return (
-    <div className="track-detail">
-      <dl>
-        {rows.map(([label, value]) => (
-          <div key={label}>
-            <dt>{label}</dt>
-            <dd>{value}</dd>
-          </div>
-        ))}
-      </dl>
-
-      {track.threat_reasons && track.threat_reasons.length > 0 && (
-        <div className="track-reasons">
-          <div className="section-label">WHY</div>
-          <ul>
-            {track.threat_reasons.map((reason) => (
-              <li key={reason}>{reason}</li>
-            ))}
-          </ul>
-        </div>
-      )}
     </div>
   );
 }
@@ -2936,7 +2931,7 @@ function AlertsPage({ cameras }) {
 // The recorded event log for one camera, or for all of them.
 //
 // This page shows what the pipeline CONCLUDED, not what it is seeing now.
-// That is the whole difference between it and Live Monitoring, and it is
+// That is the whole difference between it and the Dashboard wall, and it is
 // why every number and every word below comes from the backend:
 //
 //   summary counts   <- camera.stats.final, written by the API when the

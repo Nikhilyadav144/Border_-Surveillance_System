@@ -3658,3 +3658,1111 @@
   color: #54738b;
   padding: 7px 0;
 }
+
+/* =========================================================
+   THE COMMAND WALL (Dashboard)
+   =========================================================
+
+   A two-column page: the video wall and its lower panels on
+   the left, a narrow status rail on the right. The rail is
+   fixed-width rather than a fraction, because its contents
+   are lists of short labels - letting it grow just stretches
+   whitespace between a camera name and its state.
+
+   Everything below sets text-align explicitly. The Vite
+   starter left `#root { text-align: center }` in this project
+   once, and every block that did not say otherwise inherited
+   it. Saying so here means a future stray rule cannot quietly
+   re-centre a table of numbers.
+   ========================================================= */
+
+.page.wall {
+  max-width: 1700px;
+
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 18px;
+
+  align-items: start;
+  text-align: left;
+}
+
+.wall-main,
+.wall-rail {
+  min-width: 0;          /* lets grid children actually shrink */
+}
+
+.wall-rail .panel,
+.wall-main .panel {
+  margin-bottom: 18px;
+}
+
+/* The shared .panel-header is 74px tall, which suits a page
+   heading and dwarfs these compact panels. */
+.wall .panel-header {
+  min-height: 0;
+  padding: 12px 16px;
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+
+  color: var(--text);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1.4px;
+}
+
+.panel-glyph {
+  color: var(--cyan);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.panel-glyph.alarm {
+  color: var(--yellow);
+}
+
+/* Scope notes. Small, muted, and always present where a count
+   could otherwise be mistaken for an all-time total. */
+.panel-foot {
+  padding: 9px 16px 12px;
+
+  border-top: 1px solid var(--border);
+
+  color: var(--muted);
+  font-size: 10.5px;
+  text-align: left;
+}
+
+/* =========================================================
+   THE 2x2 VIDEO WALL
+   ========================================================= */
+
+.feed-wall {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+
+  padding: 14px;
+}
+
+.feed-tile {
+  display: flex;
+  flex-direction: column;
+
+  border: 1px solid var(--border);
+  border-radius: 10px;
+
+  background: rgba(6, 13, 22, 0.8);
+
+  overflow: hidden;
+  cursor: pointer;
+
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.feed-tile:hover {
+  border-color: rgba(66, 200, 255, 0.3);
+}
+
+.feed-tile.is-selected {
+  border-color: var(--border-bright);
+  box-shadow: var(--glow);
+}
+
+.tile-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+
+  padding: 10px 12px 6px;
+}
+
+.tile-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+
+  color: var(--cyan);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+
+.tile-badge {
+  color: var(--muted);
+
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+
+.tile-badge.live {
+  color: var(--green);
+}
+
+.tile-badge.starting {
+  color: var(--yellow);
+}
+
+.tile-action {
+  padding: 4px 10px;
+
+  border: 1px solid rgba(60, 230, 161, 0.35);
+  border-radius: 5px;
+
+  background: rgba(60, 230, 161, 0.08);
+  color: var(--green);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1px;
+
+  cursor: pointer;
+}
+
+.tile-action.stop {
+  border-color: rgba(255, 88, 116, 0.35);
+  background: rgba(255, 88, 116, 0.08);
+  color: var(--red);
+}
+
+.tile-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.tile-name {
+  padding: 0 12px 8px;
+
+  color: var(--muted-light);
+  font-size: 11.5px;
+  text-align: left;
+}
+
+/* A fixed aspect ratio keeps the four tiles the same size
+   whatever the source resolution, so the wall does not
+   re-flow when one camera starts. */
+.tile-view {
+  position: relative;
+  aspect-ratio: 16 / 9;
+
+  background: #030710;
+  overflow: hidden;
+}
+
+.tile-view img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.tile-dark {
+  position: absolute;
+  inset: 0;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+
+  color: var(--muted);
+  text-align: center;
+}
+
+.tile-dark strong {
+  color: var(--muted-light);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  letter-spacing: 1.5px;
+}
+
+.tile-dark-glyph {
+  font-size: 22px;
+  color: rgba(113, 133, 155, 0.5);
+}
+
+.tile-dark-hint {
+  font-size: 10px;
+}
+
+.tile-stats {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+
+  padding: 9px 12px 11px;
+
+  border-top: 1px solid var(--border);
+
+  color: var(--muted);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 9px;
+  letter-spacing: 0.8px;
+}
+
+.tile-stats strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.tile-stats .alarm strong {
+  color: var(--red);
+}
+
+/* =========================================================
+   LOWER PANELS
+   ========================================================= */
+
+.wall-lower {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: 18px;
+
+  align-items: start;
+}
+
+/* =========================================================
+   THREAT LEVEL TALLY
+   ========================================================= */
+
+.level-tally {
+  padding: 12px 16px;
+}
+
+.level-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
+  padding: 8px 0;
+}
+
+.level-row + .level-row {
+  border-top: 1px solid rgba(100, 180, 220, 0.07);
+}
+
+.level-dot {
+  width: 9px;
+  height: 9px;
+  flex: none;
+
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.level-dot.critical { background: var(--purple); }
+.level-dot.high     { background: var(--red); }
+.level-dot.medium   { background: var(--yellow); }
+.level-dot.low      { background: var(--green); }
+
+.level-name {
+  flex: 1;
+
+  color: var(--muted-light);
+  font-size: 12px;
+  text-align: left;
+}
+
+.level-count {
+  color: var(--text);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+}
+
+/* =========================================================
+   THREAT BADGES
+   ========================================================= */
+
+.threat-badge {
+  flex: none;
+
+  padding: 2px 7px;
+
+  border-radius: 4px;
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+}
+
+.threat-badge.critical {
+  background: rgba(155, 108, 255, 0.16);
+  color: #c3a6ff;
+}
+
+.threat-badge.high {
+  background: rgba(255, 88, 116, 0.16);
+  color: #ff8fa3;
+}
+
+.threat-badge.medium {
+  background: rgba(255, 200, 87, 0.16);
+  color: var(--yellow);
+}
+
+.threat-badge.low {
+  background: rgba(60, 230, 161, 0.14);
+  color: var(--green);
+}
+
+/* =========================================================
+   LIVE THREAT EVENTS (rail)
+   ========================================================= */
+
+.threat-events {
+  padding: 6px 14px 12px;
+
+  max-height: 330px;
+  overflow-y: auto;
+}
+
+.threat-event {
+  display: grid;
+  grid-template-columns: 10px 58px auto;
+  grid-template-areas:
+    "tick time badge"
+    ".    body body";
+  align-items: center;
+  gap: 4px 8px;
+
+  padding: 9px 0;
+}
+
+.threat-event + .threat-event {
+  border-top: 1px solid rgba(100, 180, 220, 0.07);
+}
+
+.event-tick {
+  grid-area: tick;
+
+  width: 7px;
+  height: 7px;
+
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.event-tick.critical { background: var(--purple); }
+.event-tick.high     { background: var(--red); }
+.event-tick.medium   { background: var(--yellow); }
+.event-tick.low      { background: var(--green); }
+
+.event-time {
+  grid-area: time;
+
+  color: var(--muted);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+}
+
+.threat-event .threat-badge {
+  grid-area: badge;
+  justify-self: start;
+}
+
+.event-body {
+  grid-area: body;
+
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+
+  text-align: left;
+}
+
+.event-body strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.event-body span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* =========================================================
+   CAMERA STATUS (rail)
+   ========================================================= */
+
+.status-list {
+  padding: 6px 10px 12px;
+}
+
+.status-row {
+  width: 100%;
+
+  display: grid;
+  grid-template-columns: 9px 58px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+
+  padding: 9px 6px;
+
+  border: 1px solid transparent;
+  border-radius: 6px;
+
+  background: none;
+
+  cursor: pointer;
+  text-align: left;
+}
+
+.status-row:hover {
+  background: rgba(53, 201, 255, 0.05);
+}
+
+.status-row.is-selected {
+  border-color: rgba(66, 200, 255, 0.25);
+  background: rgba(53, 201, 255, 0.06);
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.status-dot.online   { background: var(--green); }
+.status-dot.starting { background: var(--yellow); }
+
+.status-id {
+  color: var(--text);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.status-place {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.status-state {
+  color: var(--muted);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+}
+
+.status-state.online {
+  color: var(--green);
+}
+
+/* =========================================================
+   QUICK STATS (rail)
+   ========================================================= */
+
+.quick-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+
+  padding: 14px;
+}
+
+.quick-stat {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  grid-template-areas:
+    "glyph label"
+    "glyph value";
+  align-items: center;
+  gap: 0 9px;
+
+  padding: 11px 10px;
+
+  border: 1px solid var(--border);
+  border-radius: 8px;
+
+  background: rgba(8, 15, 25, 0.7);
+
+  text-align: left;
+}
+
+.quick-glyph {
+  grid-area: glyph;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  width: 26px;
+  height: 26px;
+
+  border-radius: 6px;
+
+  background: rgba(53, 201, 255, 0.1);
+  color: var(--cyan);
+
+  font-size: 12px;
+}
+
+.quick-stat.alarm .quick-glyph {
+  background: rgba(255, 88, 116, 0.12);
+  color: var(--red);
+}
+
+.quick-label {
+  grid-area: label;
+
+  color: var(--muted);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.9px;
+}
+
+.quick-value {
+  grid-area: value;
+
+  color: var(--text);
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.quick-stat.alarm .quick-value {
+  color: var(--red);
+}
+
+/* =========================================================
+   EVIDENCE THUMBNAILS
+   ========================================================= */
+
+.thumb-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 10px;
+
+  padding: 14px;
+
+  max-height: 330px;
+  overflow-y: auto;
+}
+
+.thumb {
+  margin: 0;
+
+  border: 1px solid var(--border);
+  border-radius: 8px;
+
+  background: rgba(6, 13, 22, 0.8);
+
+  overflow: hidden;
+}
+
+/* The crops are whatever shape the detected object was, from a
+   tall narrow person to a wide vehicle. A fixed box with
+   object-fit: cover keeps the strip tidy without distorting
+   anyone. */
+.thumb img {
+  width: 100%;
+  height: 88px;
+  display: block;
+
+  background: #030710;
+  object-fit: cover;
+}
+
+.thumb figcaption {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+
+  padding: 8px 9px 9px;
+
+  text-align: left;
+}
+
+.thumb figcaption strong {
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.thumb figcaption > span {
+  color: var(--muted);
+  font-size: 10px;
+
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thumb-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+
+  margin-top: 3px;
+}
+
+.thumb-foot small,
+.thumb-cam {
+  color: var(--muted);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 9px;
+}
+
+/* Without this the camera and date wrap onto three lines in a narrow
+   thumbnail and the caption becomes taller than the picture. */
+.thumb-cam {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* =========================================================
+   EVENT TIMELINE
+   ========================================================= */
+
+.timeline {
+  margin: 0;
+  padding: 8px 14px 14px;
+
+  list-style: none;
+
+  max-height: 330px;
+  overflow-y: auto;
+}
+
+.timeline-row {
+  display: grid;
+  grid-template-columns: 9px 62px 56px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "tick when camera subject badge"
+    ".    when camera what    what";
+  align-items: center;
+  gap: 2px 9px;
+
+  padding: 9px 0;
+}
+
+.timeline-row + .timeline-row {
+  border-top: 1px solid rgba(100, 180, 220, 0.07);
+}
+
+.timeline-tick {
+  grid-area: tick;
+
+  width: 7px;
+  height: 7px;
+
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.timeline-tick.critical { background: var(--purple); }
+.timeline-tick.high     { background: var(--red); }
+.timeline-tick.medium   { background: var(--yellow); }
+.timeline-tick.low      { background: var(--green); }
+
+.timeline-when {
+  grid-area: when;
+
+  display: flex;
+  flex-direction: column;
+
+  text-align: left;
+}
+
+.timeline-when strong {
+  color: var(--text);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.timeline-when small {
+  color: var(--muted);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 8.5px;
+}
+
+.timeline-camera {
+  grid-area: camera;
+
+  color: var(--cyan);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 9.5px;
+}
+
+.timeline-subject {
+  grid-area: subject;
+
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.timeline-row .threat-badge {
+  grid-area: badge;
+  justify-self: end;
+}
+
+.timeline-what {
+  grid-area: what;
+
+  /* Wraps rather than truncating. This is the only part of the row that
+     says what actually happened, so "Abnormal movement patte..." is the
+     one thing it must not do. */
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+  text-align: left;
+}
+
+/* =========================================================
+   LOADING, EMPTY AND ERROR
+   =========================================================
+   Three different things, deliberately worded differently.
+   "Nothing has happened yet" is not an error and is never
+   styled as one.
+   ========================================================= */
+
+.feed-note {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+
+  padding: 26px 18px;
+
+  color: var(--muted);
+  font-size: 11.5px;
+  text-align: center;
+}
+
+.feed-note strong {
+  color: var(--muted-light);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  letter-spacing: 1.4px;
+}
+
+.feed-note.error {
+  border-left: 2px solid var(--red);
+  background: rgba(255, 88, 116, 0.05);
+
+  text-align: left;
+}
+
+.feed-note.error strong {
+  color: var(--red);
+}
+
+.feed-note code {
+  margin-top: 4px;
+  padding: 6px 9px;
+
+  /* Explicit background and border. Without them the browser's own
+     default for <code> paints a light box, which on this theme reads as
+     a rendering fault rather than as a command to copy. */
+  border: 1px solid var(--border);
+  border-radius: 5px;
+
+  background: rgba(3, 7, 16, 0.75);
+  color: var(--cyan-soft);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  word-break: break-word;
+
+  /* It is meant to be copied. */
+  user-select: all;
+}
+
+/* =========================================================
+   NARROWER SCREENS
+   =========================================================
+   The rail drops beneath the wall, and the three lower
+   panels stack, before anything has to scroll sideways.
+   ========================================================= */
+
+@media (max-width: 1400px) {
+  .wall-lower {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .wall-lower > .panel:last-child {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 1150px) {
+  .page.wall {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .wall-lower {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 720px) {
+  .feed-wall {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .quick-stats {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* =========================================================
+   VEHICLE PLATES (ANPR)
+   =========================================================
+   One row per tracked vehicle, not per OCR attempt. The
+   plate crop sits beside the decoded origin so an operator
+   can check the reading against the picture without opening
+   anything.
+   ========================================================= */
+
+.plate-list {
+  padding: 6px 12px 12px;
+
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+.plate-row {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+
+  padding: 9px 2px;
+
+  text-align: left;
+}
+
+.plate-row + .plate-row {
+  border-top: 1px solid rgba(100, 180, 220, 0.07);
+}
+
+/* A vehicle whose plate was not read is shown, but quietly. It is
+   information, not an alert. */
+.plate-row.is-unread {
+  opacity: 0.62;
+}
+
+.plate-shot {
+  width: 74px;
+  height: 40px;
+
+  border: 1px solid var(--border);
+  border-radius: 5px;
+
+  background: #030710;
+  object-fit: cover;
+}
+
+.plate-shot.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  color: rgba(113, 133, 155, 0.5);
+  font-size: 15px;
+}
+
+.plate-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+
+  min-width: 0;
+}
+
+/* Monospace with wide tracking, because the whole point of this string
+   is that a person can read it character by character and compare it to
+   the picture next to it. */
+.plate-text {
+  color: var(--text);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 1.2px;
+}
+
+.plate-text.unread {
+  color: var(--muted);
+
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 1px;
+}
+
+/* The decoded origin. Brighter when the district is known as well as the
+   state, so a partial answer is visibly partial. */
+.plate-origin {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+/* The district is the specific answer, so it leads and it is the bright
+   one. The state is always present and acts as the qualifier. */
+.plate-district {
+  color: var(--cyan-soft);
+  font-weight: 600;
+}
+
+.plate-state {
+  color: var(--muted-light);
+}
+
+.plate-state::before {
+  content: "·";
+  margin-right: 5px;
+  color: var(--muted);
+}
+
+.plate-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+
+  margin-top: 2px;
+
+  color: var(--muted);
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 8.5px;
+  letter-spacing: 0.5px;
+}
+
+.plate-reads {
+  color: var(--muted);
+}
+
+.plate-conf {
+  color: var(--yellow);
+}
+
+.plate-conf.ok {
+  color: var(--green);
+}
+
+/* A panel count that is reporting a fault rather than a number. */
+.panel-count.warn {
+  color: var(--red);
+  font-weight: 600;
+}
+
+/* =========================================================
+   VEHICLE CLASS FROM PLATE COLOUR
+   =========================================================
+   The chip is drawn in the plate's own colour scheme, so an
+   operator recognises a commercial vehicle the same way they
+   would on the road: by the yellow.
+   ========================================================= */
+
+.plate-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 7px;
+}
+
+.plate-class {
+  padding: 1.5px 6px;
+
+  border: 1px solid transparent;
+  border-radius: 3px;
+
+  font-family: "JetBrains Mono", monospace;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: .7px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* Yellow: for hire. The one an operator is looking for. */
+.plate-class.yellow {
+  background: #ffc857;
+  border-color: #ffc857;
+  color: #2a2000;
+}
+
+.plate-class.white {
+  background: rgba(233, 243, 250, 0.9);
+  border-color: rgba(233, 243, 250, 0.9);
+  color: #1a2733;
+}
+
+.plate-class.green_white,
+.plate-class.green_yellow {
+  background: #2e8b57;
+  border-color: #2e8b57;
+  color: #eafff4;
+}
+
+/* Electric AND commercial: green plate, yellow lettering. */
+.plate-class.green_yellow {
+  border-color: #ffc857;
+  color: #ffe9b0;
+}
+
+.plate-class.black {
+  background: #14202c;
+  border-color: #ffc857;
+  color: #ffc857;
+}
+
+.plate-class.red {
+  background: #c0392b;
+  border-color: #c0392b;
+  color: #fff;
+}
+
+.plate-class.blue {
+  background: #1668a8;
+  border-color: #1668a8;
+  color: #fff;
+}
